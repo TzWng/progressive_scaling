@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+data_tokenized/
+model_init/
+qwen05b/
+pile10k/
+fineweb_raw/
+*.parquet
+checkpoints/
+outputs/
+*.safetensors
