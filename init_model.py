@@ -46,13 +46,18 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="./model_init", help="output dir")
     p.add_argument("--tiny", action="store_true", help="use a tiny config for smoke tests")
+    p.add_argument("--layers", type=int, default=None,
+                   help="override num_hidden_layers (e.g. 12 for a small progressive-growth start; "
+                        "default is the full 24-layer Qwen2.5-0.5B architecture)")
     p.add_argument("--tokenizer", default=TOKENIZER_NAME)
     args = p.parse_args()
 
     print(f"Loading tokenizer: {args.tokenizer}")
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
 
-    arch = TINY if args.tiny else QWEN2_5_0_5B
+    arch = dict(TINY if args.tiny else QWEN2_5_0_5B)
+    if args.layers is not None:
+        arch["num_hidden_layers"] = args.layers
     cfg = Qwen2Config(
         vocab_size=len(tok),
         bos_token_id=tok.bos_token_id,
@@ -66,6 +71,7 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Layers:           {cfg.num_hidden_layers}")
     print(f"Total params:     {n_params/1e6:.1f}M")
     print(f"Trainable params: {n_train/1e6:.1f}M")
 

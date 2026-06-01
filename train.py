@@ -17,6 +17,7 @@ Resume:
     python train.py --resume
 """
 import argparse
+import json
 import os
 import time
 
@@ -29,30 +30,49 @@ from transformers import (
     TrainerCallback,
     TrainingArguments,
     default_data_collator,
+    set_seed,
 )
 
 
-class LossLogger(TrainerCallback):
+class MetricLogger(TrainerCallback):
     """Append training metrics to a tab-separated file for later plotting.
 
-    Columns: step  epoch  loss  lr  grad_norm  seconds
+    Columns: step  tokens  flops  epoch  loss  lr  grad_norm  seconds
     Load with: pandas.read_csv(path, sep="\\t")
+
+    `step/tokens/flops` include prior-phase offsets, so a grown run's phase-2 log
+    continues phase-1 as ONE curve. FLOPs use the standard ~6*N*tokens estimate
+    (N = current-phase param count), which is what model-growth papers plot
+    loss against for a FLOPs-matched fair comparison.
     """
 
-    def __init__(self, path):
+    HEADER = "step\ttokens\tflops\tepoch\tloss\tlr\tgrad_norm\tseconds\n"
+
+    def __init__(self, path, n_params, tokens_per_step,
+                 prior_steps=0, prior_tokens=0, prior_flops=0.0):
         self.path = path
+        self.n_params = n_params
+        self.tokens_per_step = tokens_per_step
+        self.prior_steps = prior_steps
+        self.prior_tokens = prior_tokens
+        self.prior_flops = prior_flops
         self.start = time.time()
-        # Write header fresh unless we're resuming onto an existing log.
+        # Write header fresh unless we're appending to an existing log.
         if not os.path.exists(path):
             with open(path, "w") as f:
-                f.write("step\tepoch\tloss\tlr\tgrad_norm\tseconds\n")
+                f.write(self.HEADER)
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         logs = logs or {}
         if "loss" not in logs:  # skip eval/other log events
             return
+        phase_tokens = state.global_step * self.tokens_per_step
+        tokens = self.prior_tokens + phase_tokens
+        flops = self.prior_flops + 6 * self.n_params * phase_tokens
         row = [
-            state.global_step,
+            self.prior_steps + state.global_step,
+            tokens,
+            f"{flops:.6e}",
             round(logs.get("epoch", 0.0), 4),
             logs.get("loss", ""),
             logs.get("learning_rate", ""),
@@ -86,12 +106,23 @@ def main():
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--log-steps", type=int, default=10)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--seed", type=int, default=42,
+                   help="fixed seed for reproducible weight init + data order (keep IDENTICAL "
+                        "across baseline and grown runs for a fair comparison)")
     p.add_argument("--no-grad-ckpt", action="store_true",
                    help="disable gradient checkpointing (faster; use when VRAM is ample, e.g. 0.5B on H100)")
     p.add_argument("--log-file", default="log.txt",
-                   help="tab-separated file recording step/loss/lr for plotting")
+                   help="tab-separated file recording step/tokens/flops/loss/lr for plotting")
+    # --- offsets for continuing a grown run as ONE continuous curve (phase 2) ---
+    p.add_argument("--prior-steps", type=int, default=0,
+                   help="optimizer steps already done before this phase (grown-run continuation)")
+    p.add_argument("--prior-tokens", type=int, default=0,
+                   help="tokens already consumed before this phase")
+    p.add_argument("--prior-flops", type=float, default=0.0,
+                   help="FLOPs already spent before this phase (e.g. small-model phase)")
     args = p.parse_args()
 
+    set_seed(args.seed)
     device = pick_device()
     use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
     print(f"Device: {device} | bf16: {use_bf16}")
@@ -123,6 +154,14 @@ def main():
     ds = load_from_disk(args.data)
     ds.set_format(type="torch", columns=["input_ids", "labels"])
 
+    # --- accounting for tokens / FLOPs logging ---
+    seq_len = len(ds[0]["input_ids"])
+    n_params = sum(p.numel() for p in model.parameters())
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    tokens_per_step = args.batch_size * args.grad_accum * seq_len * world_size
+    print(f"Model layers: {model.config.num_hidden_layers} | params: {n_params/1e6:.1f}M | "
+          f"seq_len: {seq_len} | tokens/step: {tokens_per_step}")
+
     targs = TrainingArguments(
         output_dir=args.out,
         per_device_train_batch_size=args.batch_size,
@@ -142,7 +181,25 @@ def main():
         save_total_limit=3,
         report_to="none",
         dataloader_num_workers=2,
+        seed=args.seed,
+        data_seed=args.seed,
     )
+
+    # Persist the full run definition so the baseline and grown runs are
+    # reproducible and provably comparable (same data, seed, hyperparameters).
+    os.makedirs(args.out, exist_ok=True)
+    run_cfg = dict(
+        model=args.model, data=args.data, seed=args.seed,
+        num_hidden_layers=model.config.num_hidden_layers, n_params=n_params,
+        seq_len=seq_len, batch_size=args.batch_size, grad_accum=args.grad_accum,
+        tokens_per_step=tokens_per_step, world_size=world_size,
+        lr=args.lr, weight_decay=args.weight_decay, warmup_ratio=args.warmup_ratio,
+        lr_scheduler="cosine", max_steps=args.max_steps, epochs=args.epochs,
+        prior_steps=args.prior_steps, prior_tokens=args.prior_tokens,
+        prior_flops=args.prior_flops,
+    )
+    with open(os.path.join(args.out, "run_config.json"), "w") as f:
+        json.dump(run_cfg, f, indent=2)
 
     trainer = Trainer(
         model=model,
@@ -150,10 +207,11 @@ def main():
         train_dataset=ds,
         data_collator=default_data_collator,
         processing_class=tok,
-        callbacks=[LossLogger(args.log_file)],
+        callbacks=[MetricLogger(args.log_file, n_params, tokens_per_step,
+                                args.prior_steps, args.prior_tokens, args.prior_flops)],
     )
 
-    print(f"Logging loss to: {args.log_file}")
+    print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
     trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model(args.out)
