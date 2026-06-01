@@ -17,6 +17,8 @@ Resume:
     python train.py --resume
 """
 import argparse
+import os
+import time
 
 import torch
 from datasets import load_from_disk
@@ -24,9 +26,41 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     default_data_collator,
 )
+
+
+class LossLogger(TrainerCallback):
+    """Append training metrics to a tab-separated file for later plotting.
+
+    Columns: step  epoch  loss  lr  grad_norm  seconds
+    Load with: pandas.read_csv(path, sep="\\t")
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.start = time.time()
+        # Write header fresh unless we're resuming onto an existing log.
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write("step\tepoch\tloss\tlr\tgrad_norm\tseconds\n")
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        logs = logs or {}
+        if "loss" not in logs:  # skip eval/other log events
+            return
+        row = [
+            state.global_step,
+            round(logs.get("epoch", 0.0), 4),
+            logs.get("loss", ""),
+            logs.get("learning_rate", ""),
+            logs.get("grad_norm", ""),
+            round(time.time() - self.start, 1),
+        ]
+        with open(self.path, "a") as f:
+            f.write("\t".join(str(x) for x in row) + "\n")
 
 
 def pick_device():
@@ -54,6 +88,8 @@ def main():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--no-grad-ckpt", action="store_true",
                    help="disable gradient checkpointing (faster; use when VRAM is ample, e.g. 0.5B on H100)")
+    p.add_argument("--log-file", default="log.txt",
+                   help="tab-separated file recording step/loss/lr for plotting")
     args = p.parse_args()
 
     device = pick_device()
@@ -114,8 +150,10 @@ def main():
         train_dataset=ds,
         data_collator=default_data_collator,
         processing_class=tok,
+        callbacks=[LossLogger(args.log_file)],
     )
 
+    print(f"Logging loss to: {args.log_file}")
     print("Starting pretraining...")
     trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model(args.out)

@@ -9,3 +9,5 @@ fineweb_raw/
 checkpoints/
 outputs/
 *.safetensors
+log.txt
+*.log
