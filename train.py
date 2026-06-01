@@ -18,10 +18,12 @@ Resume:
 """
 import argparse
 import json
+import math
 import os
 import time
 
 import torch
+from torch.optim.lr_scheduler import LambdaLR
 from datasets import load_from_disk
 from transformers import (
     AutoModelForCausalLM,
@@ -32,6 +34,69 @@ from transformers import (
     default_data_collator,
     set_seed,
 )
+
+
+def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps):
+    """One warmup+cosine schedule spanning `total_steps` (GLOBAL horizon).
+
+    Returns a function of the LOCAL step within the current phase. The global
+    step is prior_steps + local_step, so every phase rides the SAME cosine:
+
+      * baseline / phase-1 (prior_steps=0): standard warmup -> cosine to 0,
+        optionally stopped early (see --stop-at-step / --growth-ratio).
+      * grown phase-2 (prior_steps>0): a short linear re-warmup over
+        `rewarmup_steps` ramps the LR back up to the cosine value at the resume
+        point, then rejoins and follows the SAME global cosine down to 0.
+
+    This keeps the baseline and the grown run on an identical LR trajectory
+    (a fair comparison), differing only by the small re-warmup bump at growth.
+    """
+    def cos_factor(g):
+        if g < warmup_steps:
+            return g / max(1, warmup_steps)
+        prog = (g - warmup_steps) / max(1, total_steps - warmup_steps)
+        prog = min(1.0, max(0.0, prog))
+        return 0.5 * (1.0 + math.cos(math.pi * prog))
+
+    def lr_lambda(local_step):
+        g = prior_steps + local_step
+        if rewarmup_steps > 0 and local_step < rewarmup_steps:
+            return (local_step / rewarmup_steps) * cos_factor(prior_steps + rewarmup_steps)
+        return cos_factor(g)
+
+    return lr_lambda
+
+
+class GrowTrainer(Trainer):
+    """Trainer that installs the unified warmup+cosine schedule above."""
+
+    def set_schedule(self, total_steps, warmup_steps, prior_steps, rewarmup_steps):
+        self._sched = dict(total_steps=total_steps, warmup_steps=warmup_steps,
+                           prior_steps=prior_steps, rewarmup_steps=rewarmup_steps)
+
+    def create_scheduler(self, num_training_steps, optimizer=None):
+        if self.lr_scheduler is None:
+            opt = self.optimizer if optimizer is None else optimizer
+            s = self._sched
+            total = s["total_steps"] if s["total_steps"] > 0 else s["prior_steps"] + num_training_steps
+            self.lr_scheduler = LambdaLR(
+                opt,
+                make_lr_lambda(total, s["warmup_steps"], s["prior_steps"], s["rewarmup_steps"]),
+            )
+        return self.lr_scheduler
+
+
+class StopAtStep(TrainerCallback):
+    """Stop training at a global step BELOW max_steps, leaving the cosine horizon
+    (= max_steps/total_steps) intact. Used to end phase-1 at the growth point."""
+
+    def __init__(self, stop_step):
+        self.stop_step = stop_step
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.stop_step > 0 and state.global_step >= self.stop_step:
+            control.should_training_stop = True
+        return control
 
 
 class MetricLogger(TrainerCallback):
@@ -113,7 +178,18 @@ def main():
                    help="disable gradient checkpointing (faster; use when VRAM is ample, e.g. 0.5B on H100)")
     p.add_argument("--log-file", default="log.txt",
                    help="tab-separated file recording step/tokens/flops/loss/lr for plotting")
-    # --- offsets for continuing a grown run as ONE continuous curve (phase 2) ---
+    # --- fair-comparison schedule controls ---
+    p.add_argument("--total-steps", type=int, default=-1,
+                   help="GLOBAL cosine horizon shared by baseline + grown run "
+                        "(default: this phase's max-steps). MUST match across runs.")
+    p.add_argument("--growth-ratio", type=float, default=None,
+                   help="phase-1 only: stop the small model at this fraction of --total-steps "
+                        "(the ablation knob, e.g. 0.25). Cosine stays sized to the full horizon.")
+    p.add_argument("--stop-at-step", type=int, default=-1,
+                   help="phase-1 only: explicit global step to stop at (alternative to --growth-ratio)")
+    p.add_argument("--rewarmup-steps", type=int, default=0,
+                   help="grown phase-2: linear re-warmup length right after growth")
+    # --- offsets so a grown run's phase-2 log continues phase-1 as ONE curve ---
     p.add_argument("--prior-steps", type=int, default=0,
                    help="optimizer steps already done before this phase (grown-run continuation)")
     p.add_argument("--prior-tokens", type=int, default=0,
@@ -162,16 +238,24 @@ def main():
     print(f"Model layers: {model.config.num_hidden_layers} | params: {n_params/1e6:.1f}M | "
           f"seq_len: {seq_len} | tokens/step: {tokens_per_step}")
 
+    # Resolve the GLOBAL cosine horizon and warmup (shared across baseline + grow).
+    total_steps = args.total_steps if args.total_steps > 0 else (args.prior_steps + args.max_steps)
+    warmup_steps = int(args.warmup_ratio * total_steps) if total_steps > 0 else 0
+    stop_at = args.stop_at_step
+    if args.growth_ratio is not None:
+        stop_at = round(args.growth_ratio * total_steps)
+    print(f"Schedule: total_steps(global)={total_steps} warmup={warmup_steps} "
+          f"prior_steps={args.prior_steps} rewarmup={args.rewarmup_steps} stop_at={stop_at}")
+
     targs = TrainingArguments(
         output_dir=args.out,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=0,  # warmup handled by the custom unified scheduler
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
-        lr_scheduler_type="cosine",
         adam_beta1=0.9,
         adam_beta2=0.95,
         max_grad_norm=1.0,
@@ -194,22 +278,30 @@ def main():
         seq_len=seq_len, batch_size=args.batch_size, grad_accum=args.grad_accum,
         tokens_per_step=tokens_per_step, world_size=world_size,
         lr=args.lr, weight_decay=args.weight_decay, warmup_ratio=args.warmup_ratio,
-        lr_scheduler="cosine", max_steps=args.max_steps, epochs=args.epochs,
+        lr_scheduler="cosine", max_steps=args.max_steps, total_steps=total_steps,
+        warmup_steps=warmup_steps, epochs=args.epochs,
+        growth_ratio=args.growth_ratio, stop_at_step=stop_at,
+        rewarmup_steps=args.rewarmup_steps,
         prior_steps=args.prior_steps, prior_tokens=args.prior_tokens,
         prior_flops=args.prior_flops,
     )
     with open(os.path.join(args.out, "run_config.json"), "w") as f:
         json.dump(run_cfg, f, indent=2)
 
-    trainer = Trainer(
+    callbacks = [MetricLogger(args.log_file, n_params, tokens_per_step,
+                              args.prior_steps, args.prior_tokens, args.prior_flops)]
+    if stop_at and stop_at > 0:
+        callbacks.append(StopAtStep(stop_at))
+
+    trainer = GrowTrainer(
         model=model,
         args=targs,
         train_dataset=ds,
         data_collator=default_data_collator,
         processing_class=tok,
-        callbacks=[MetricLogger(args.log_file, n_params, tokens_per_step,
-                                args.prior_steps, args.prior_tokens, args.prior_flops)],
+        callbacks=callbacks,
     )
+    trainer.set_schedule(total_steps, warmup_steps, args.prior_steps, args.rewarmup_steps)
 
     print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
