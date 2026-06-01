@@ -52,6 +52,8 @@ def main():
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--log-steps", type=int, default=10)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--no-grad-ckpt", action="store_true",
+                   help="disable gradient checkpointing (faster; use when VRAM is ample, e.g. 0.5B on H100)")
     args = p.parse_args()
 
     device = pick_device()
@@ -74,8 +76,9 @@ def main():
         torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
         attn_implementation=attn_impl,
     )
-    model.config.use_cache = False  # required when gradient checkpointing
-    if device == "cuda":
+    use_ckpt = device == "cuda" and not args.no_grad_ckpt
+    model.config.use_cache = False if use_ckpt else model.config.use_cache
+    if use_ckpt:
         model.gradient_checkpointing_enable()
 
     tok = AutoTokenizer.from_pretrained(args.model)
