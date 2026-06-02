@@ -199,7 +199,7 @@ def main():
     p.add_argument("--warmup-ratio", type=float, default=0.02)
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help="override epochs; -1 disables")
-    p.add_argument("--save-steps", type=int, default=500)
+    p.add_argument("--save-steps", type=int, default=3000)
     p.add_argument("--log-steps", type=int, default=10)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=42,
