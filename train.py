@@ -21,6 +21,7 @@ import json
 import math
 import os
 import time
+import types
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
@@ -94,21 +95,25 @@ class GrowTrainer(Trainer):
         # same block skipped at the same step), so the comparison stays fair.
         opt = super().create_optimizer()
         self._skipped_nan_steps = 0
-        orig_step = opt.step
+        trainer = self
+        # Bind as a real method (via MethodType) rather than assigning a plain
+        # function -- torch's LambdaLR patches opt.step and expects a bound
+        # method (reads .__func__), which a plain function lacks.
+        orig_step = type(opt).step
 
-        def safe_step(*a, **k):
+        def safe_step(optimizer, *a, **k):
             finite = all(
                 p.grad is None or torch.isfinite(p.grad).all()
-                for group in opt.param_groups for p in group["params"]
+                for group in optimizer.param_groups for p in group["params"]
             )
             if not finite:
-                self._skipped_nan_steps += 1
+                trainer._skipped_nan_steps += 1
                 print(f"[skip] non-finite grad at global_step "
-                      f"{self.state.global_step} (total skipped: {self._skipped_nan_steps})")
+                      f"{trainer.state.global_step} (total skipped: {trainer._skipped_nan_steps})")
                 return None
-            return orig_step(*a, **k)
+            return orig_step(optimizer, *a, **k)
 
-        opt.step = safe_step
+        opt.step = types.MethodType(safe_step, opt)
         return opt
 
 
