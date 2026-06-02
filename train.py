@@ -174,6 +174,9 @@ def main():
     p.add_argument("--seed", type=int, default=42,
                    help="fixed seed for reproducible weight init + data order (keep IDENTICAL "
                         "across baseline and grown runs for a fair comparison)")
+    p.add_argument("--fp32", action="store_true",
+                   help="disable bf16 mixed precision; train fully in fp32 "
+                        "(slower but numerically robust -- use to diagnose/avoid NaN)")
     p.add_argument("--no-grad-ckpt", action="store_true",
                    help="disable gradient checkpointing (faster; use when VRAM is ample, e.g. 0.5B on H100)")
     p.add_argument("--log-file", default="log.txt",
@@ -200,7 +203,7 @@ def main():
 
     set_seed(args.seed)
     device = pick_device()
-    use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
+    use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported() and not args.fp32
     print(f"Device: {device} | bf16: {use_bf16}")
 
     # Prefer flash-attn if installed; otherwise fall back to PyTorch SDPA
