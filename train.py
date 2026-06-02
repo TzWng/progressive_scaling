@@ -85,6 +85,32 @@ class GrowTrainer(Trainer):
             )
         return self.lr_scheduler
 
+    def create_optimizer(self):
+        # Wrap the optimizer so a step with any non-finite gradient is skipped
+        # instead of poisoning the weights with NaN/Inf. From-scratch bf16
+        # pretraining occasionally hits a degenerate packed block whose backward
+        # produces a non-finite grad; skipping that single update keeps training
+        # alive and is symmetric across baseline/grown runs (same data+seed ->
+        # same block skipped at the same step), so the comparison stays fair.
+        opt = super().create_optimizer()
+        self._skipped_nan_steps = 0
+        orig_step = opt.step
+
+        def safe_step(*a, **k):
+            finite = all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for group in opt.param_groups for p in group["params"]
+            )
+            if not finite:
+                self._skipped_nan_steps += 1
+                print(f"[skip] non-finite grad at global_step "
+                      f"{self.state.global_step} (total skipped: {self._skipped_nan_steps})")
+                return None
+            return orig_step(*a, **k)
+
+        opt.step = safe_step
+        return opt
+
 
 class StopAtStep(TrainerCallback):
     """Stop training at a global step BELOW max_steps, leaving the cosine horizon
