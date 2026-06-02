@@ -214,9 +214,14 @@ def main():
             print("flash-attn not installed; using PyTorch SDPA backend instead.")
 
     print(f"Loading initialized model: {args.model} (attn={attn_impl})")
+    # IMPORTANT: load the model in fp32 even when training in bf16. The Trainer's
+    # bf16=True does autocast for the forward/backward (fast bf16 compute) while
+    # keeping fp32 MASTER WEIGHTS for the optimizer. Loading the weights directly
+    # in bf16 means AdamW updates bf16 params with no fp32 copy, which is
+    # numerically fragile and can diverge to NaN on an unlucky batch.
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
+        torch_dtype=torch.float32,
         attn_implementation=attn_impl,
     )
     use_ckpt = device == "cuda" and not args.no_grad_ckpt
