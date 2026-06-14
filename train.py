@@ -199,7 +199,13 @@ def main():
     p.add_argument("--warmup-ratio", type=float, default=0.02)
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help="override epochs; -1 disables")
-    p.add_argument("--save-steps", type=int, default=3000)
+    p.add_argument("--save-steps", type=int, default=1000,
+                   help="checkpoint interval (bigger = fewer Drive writes, less disk)")
+    p.add_argument("--save-total-limit", type=int, default=1,
+                   help="how many checkpoints to keep (1 = only the latest, for resume). "
+                        "Each 0.5B checkpoint is ~6GB (fp32 weights + AdamW state); keeping "
+                        "fewer avoids filling Drive. Use 2 if you want a fallback in case a "
+                        "save is interrupted mid-write.")
     p.add_argument("--log-steps", type=int, default=10)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=42,
@@ -301,7 +307,7 @@ def main():
         bf16=use_bf16,
         logging_steps=args.log_steps,
         save_steps=args.save_steps,
-        save_total_limit=3,
+        save_total_limit=args.save_total_limit,
         report_to="none",
         dataloader_num_workers=2,
         seed=args.seed,
