@@ -127,6 +127,9 @@ class StopAtStep(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if self.stop_step > 0 and state.global_step >= self.stop_step:
             control.should_training_stop = True
+            # Force a full, resumable checkpoint at the exact stop step even when
+            # it isn't a multiple of save_steps (e.g. stop_at=7500, save_steps=1000).
+            control.should_save = True
         return control
 
 
@@ -153,8 +156,8 @@ class MetricLogger(TrainerCallback):
         self.prior_tokens = prior_tokens
         self.prior_flops = prior_flops
         self.start = time.time()
-        # Write header fresh unless we're appending to an existing log.
-        if not os.path.exists(path):
+        # Write header fresh unless we're appending to an existing, non-empty log.
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
             with open(path, "w") as f:
                 f.write(self.HEADER)
 
@@ -199,15 +202,17 @@ def main():
     p.add_argument("--warmup-ratio", type=float, default=0.02)
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help="override epochs; -1 disables")
-    p.add_argument("--save-steps", type=int, default=1000,
-                   help="checkpoint interval (bigger = fewer Drive writes, less disk)")
-    p.add_argument("--save-total-limit", type=int, default=1,
-                   help="how many checkpoints to keep (1 = only the latest, for resume). "
-                        "Each 0.5B checkpoint is ~6GB (fp32 weights + AdamW state); keeping "
-                        "fewer avoids filling Drive. Use 2 if you want a fallback in case a "
-                        "save is interrupted mid-write.")
+    p.add_argument("--save-steps", type=int, default=1000)
+    p.add_argument("--save-total-limit", type=int, default=3,
+                   help="max checkpoints to keep (default: keep ALL -- needed when each "
+                        "checkpoint is archived/uploaded separately)")
     p.add_argument("--log-steps", type=int, default=10)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume-from", default=None,
+                   help="path to a SPECIFIC checkpoint dir to resume from "
+                        "(overrides --resume's 'latest' behavior). HF Trainer skips the "
+                        "already-consumed batches, so training continues in the same data "
+                        "order from this step -- no data reuse.")
     p.add_argument("--seed", type=int, default=42,
                    help="fixed seed for reproducible weight init + data order (keep IDENTICAL "
                         "across baseline and grown runs for a fair comparison)")
@@ -350,7 +355,8 @@ def main():
 
     print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
-    trainer.train(resume_from_checkpoint=args.resume)
+    resume = args.resume_from if args.resume_from else args.resume
+    trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(args.out)
     tok.save_pretrained(args.out)
     print(f"Done. Final model saved to: {args.out}")
