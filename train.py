@@ -138,6 +138,16 @@ class GrowTrainer(Trainer):
             return orig_step(optimizer, *a, **k)
 
         opt.step = types.MethodType(safe_step, opt)
+
+        # Optional: warm-start the moments of the KEPT layers from the source checkpoint's
+        # optimizer (Staged-Training style) to avoid the cold-Adam slowdown after growth.
+        src = getattr(self, "_init_opt_from", None)
+        if src:
+            try:
+                from momentum_transfer import transfer_moments
+                transfer_moments(self.model, opt, src, self.get_decay_parameter_names)
+            except Exception as e:
+                print(f"[momentum transfer] FAILED ({e}); continuing with fresh optimizer.")
         return opt
 
 
@@ -194,7 +204,8 @@ class MetricLogger(TrainerCallback):
         # grown run's curve continues the baseline at prior_steps with no warm-up gap.
         eff = state.global_step - self.rewarmup_steps
         if eff <= 0:
-            return  # warm-up preamble: not recorded as a training step
+            return  # warm-up preamble (eff<0) + the prior_steps anchor (eff==0, already
+            #         the prior phase's last logged row) -> first grown row is prior_steps+1 on
         phase_tokens = eff * self.tokens_per_step
         tokens = self.prior_tokens + phase_tokens
         flops = self.prior_flops + 6 * self.n_params * phase_tokens
@@ -267,6 +278,10 @@ def main():
     # --- offsets so a grown run's phase-2 log continues phase-1 as ONE curve ---
     p.add_argument("--prior-steps", type=int, default=0,
                    help="optimizer steps already done before this phase (grown-run continuation)")
+    p.add_argument("--init-optimizer-from", default=None,
+                   help="warm-start AdamW moments from this source checkpoint's optimizer.pt: "
+                        "kept/original layers + embeddings get the source moments, inserted layers "
+                        "stay fresh. Mitigates the cold-optimizer slowdown after growth.")
     p.add_argument("--skip-samples", type=int, default=0,
                    help="phase-2: number of samples the prior phase consumed (overrides the "
                         "auto value prior_steps*batch_size*grad_accum). Normally leave 0 and just "
@@ -423,6 +438,7 @@ def main():
     )
     trainer.set_schedule(total_steps, warmup_steps, args.prior_steps, args.rewarmup_steps)
     trainer._sequential_data = sequential_data  # feed the permuted slice in order (phase-2)
+    trainer._init_opt_from = args.init_optimizer_from  # optional Adam-moment warm-start
 
     print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
