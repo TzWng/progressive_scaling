@@ -193,7 +193,7 @@ class MetricLogger(TrainerCallback):
         # Exclude the uncounted warm-up preamble: effective step 0 == prior_steps, so a
         # grown run's curve continues the baseline at prior_steps with no warm-up gap.
         eff = state.global_step - self.rewarmup_steps
-        if eff < 0:
+        if eff <= 0:
             return  # warm-up preamble: not recorded as a training step
         phase_tokens = eff * self.tokens_per_step
         tokens = self.prior_tokens + phase_tokens
