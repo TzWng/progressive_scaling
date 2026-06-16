@@ -60,10 +60,16 @@ def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps):
         return 0.5 * (1.0 + math.cos(math.pi * prog))
 
     def lr_lambda(local_step):
-        g = prior_steps + local_step
         if rewarmup_steps > 0 and local_step < rewarmup_steps:
-            return (local_step / rewarmup_steps) * cos_factor(prior_steps + rewarmup_steps)
-        return cos_factor(g)
+            # UNCOUNTED warm-up preamble: ramp 0 -> the baseline LR AT the resume point
+            # (prior_steps). These steps do not advance the cosine, so when warm-up ends
+            # the LR equals the baseline's value at prior_steps exactly.
+            return (local_step / rewarmup_steps) * cos_factor(prior_steps)
+        # After warm-up, subtract the warm-up length so the cosine position equals the
+        # baseline's: the first real step sits exactly at prior_steps, then rides the
+        # SAME global cosine down to 0 -- identical to baseline from prior_steps onward.
+        eff = local_step - rewarmup_steps
+        return cos_factor(prior_steps + eff)
 
     return lr_lambda
 
@@ -74,6 +80,24 @@ class GrowTrainer(Trainer):
     def set_schedule(self, total_steps, warmup_steps, prior_steps, rewarmup_steps):
         self._sched = dict(total_steps=total_steps, warmup_steps=warmup_steps,
                            prior_steps=prior_steps, rewarmup_steps=rewarmup_steps)
+
+    def get_decay_parameter_names(self, model):
+        # Keep weight decay OFF for the zero-init residual gates (alpha/beta):
+        # decaying a gate pulls it back toward 0 and fights it opening, which is
+        # exactly the dynamic the grown model relies on. Everything else keeps the
+        # Trainer's default decay set (which already excludes biases + norms).
+        names = super().get_decay_parameter_names(model)
+        return [n for n in names if not n.endswith(".gate")]
+
+    def _get_train_sampler(self, *args, **kwargs):
+        # Phase-2 continuation feeds the already globally-permuted dataset IN ORDER
+        # (no per-epoch reshuffle), so the grown run lines up sample-for-sample with
+        # the baseline from prior_steps onward. Phase-1 itself read epoch-0 in this
+        # same permutation order, so this is a faithful continuation.
+        if getattr(self, "_sequential_data", False):
+            from torch.utils.data import SequentialSampler
+            return SequentialSampler(self.train_dataset)
+        return super()._get_train_sampler(*args, **kwargs)
 
     def create_scheduler(self, num_training_steps, optimizer=None):
         if self.lr_scheduler is None:
@@ -148,13 +172,14 @@ class MetricLogger(TrainerCallback):
     HEADER = "step\ttokens\tflops\tepoch\tloss\tlr\tgrad_norm\tseconds\n"
 
     def __init__(self, path, n_params, tokens_per_step,
-                 prior_steps=0, prior_tokens=0, prior_flops=0.0):
+                 prior_steps=0, prior_tokens=0, prior_flops=0.0, rewarmup_steps=0):
         self.path = path
         self.n_params = n_params
         self.tokens_per_step = tokens_per_step
         self.prior_steps = prior_steps
         self.prior_tokens = prior_tokens
         self.prior_flops = prior_flops
+        self.rewarmup_steps = rewarmup_steps
         self.start = time.time()
         # Write header fresh unless we're appending to an existing, non-empty log.
         if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -165,11 +190,16 @@ class MetricLogger(TrainerCallback):
         logs = logs or {}
         if "loss" not in logs:  # skip eval/other log events
             return
-        phase_tokens = state.global_step * self.tokens_per_step
+        # Exclude the uncounted warm-up preamble: effective step 0 == prior_steps, so a
+        # grown run's curve continues the baseline at prior_steps with no warm-up gap.
+        eff = state.global_step - self.rewarmup_steps
+        if eff < 0:
+            return  # warm-up preamble: not recorded as a training step
+        phase_tokens = eff * self.tokens_per_step
         tokens = self.prior_tokens + phase_tokens
         flops = self.prior_flops + 6 * self.n_params * phase_tokens
         row = [
-            self.prior_steps + state.global_step,
+            self.prior_steps + eff,
             tokens,
             f"{flops:.6e}",
             round(logs.get("epoch", 0.0), 4),
@@ -203,7 +233,7 @@ def main():
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help="override epochs; -1 disables")
     p.add_argument("--save-steps", type=int, default=1000)
-    p.add_argument("--save-total-limit", type=int, default=3,
+    p.add_argument("--save-total-limit", type=int, default=None,
                    help="max checkpoints to keep (default: keep ALL -- needed when each "
                         "checkpoint is archived/uploaded separately)")
     p.add_argument("--log-steps", type=int, default=10)
@@ -237,6 +267,11 @@ def main():
     # --- offsets so a grown run's phase-2 log continues phase-1 as ONE curve ---
     p.add_argument("--prior-steps", type=int, default=0,
                    help="optimizer steps already done before this phase (grown-run continuation)")
+    p.add_argument("--skip-samples", type=int, default=0,
+                   help="phase-2: number of samples the prior phase consumed (overrides the "
+                        "auto value prior_steps*batch_size*grad_accum). Normally leave 0 and just "
+                        "pass --prior-steps; the grown run then continues the data stream in order, "
+                        "warm-up re-reading the prior phase's last rewarmup_steps steps.")
     p.add_argument("--prior-tokens", type=int, default=0,
                    help="tokens already consumed before this phase")
     p.add_argument("--prior-flops", type=float, default=0.0,
@@ -268,16 +303,40 @@ def main():
         args.model,
         torch_dtype=torch.float32,
         attn_implementation=attn_impl,
+        trust_remote_code=True,  # load the grown model's custom gated architecture
     )
     use_ckpt = device == "cuda" and not args.no_grad_ckpt
     model.config.use_cache = False if use_ckpt else model.config.use_cache
     if use_ckpt:
         model.gradient_checkpointing_enable()
 
-    tok = AutoTokenizer.from_pretrained(args.model)
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     print(f"Loading tokenized dataset: {args.data}")
     ds = load_from_disk(args.data)
+    # phase-2 continuation (prior_steps>0): line the grown run up with the baseline
+    # sample-for-sample. Phase-1 read epoch-0 in the seeded permutation order
+    # randperm(n, seed); we rebuild that permutation and feed the slice IN ORDER
+    # (SequentialSampler, see GrowTrainer). The counted stream starts exactly at the
+    # prior phase's stopping sample (prior_steps), while the UNCOUNTED warm-up
+    # re-reads the prior phase's last `rewarmup_steps` steps -> zero misalignment.
+    sequential_data = False
+    if args.prior_steps > 0 or args.skip_samples > 0:
+        ws = int(os.environ.get("WORLD_SIZE", "1"))
+        samples_per_step = args.batch_size * args.grad_accum * ws
+        prior_samples = args.skip_samples if args.skip_samples > 0 else args.prior_steps * samples_per_step
+        warmup_samples = args.rewarmup_steps * samples_per_step
+        start = max(0, prior_samples - warmup_samples)
+        g = torch.Generator().manual_seed(args.seed)
+        perm = torch.randperm(len(ds), generator=g).tolist()
+        ds = ds.select(perm[start:])
+        sequential_data = True
+        eff_total = args.total_steps if args.total_steps > 0 else (args.prior_steps + args.max_steps)
+        need = samples_per_step * (args.rewarmup_steps + max(0, eff_total - args.prior_steps))
+        print(f"Continuing data IN ORDER from sample {start} "
+              f"(prior {prior_samples} - warmup {warmup_samples}); warm-up re-reads the prior "
+              f"phase's last {args.rewarmup_steps} steps, then the COUNTED stream starts at the "
+              f"prior stopping sample {prior_samples}. {len(ds)} samples available (need {need}).")
     ds.set_format(type="torch", columns=["input_ids", "labels"])
 
     # --- accounting for tokens / FLOPs logging ---
@@ -297,6 +356,16 @@ def main():
     print(f"Schedule: total_steps(global)={total_steps} warmup={warmup_steps} "
           f"prior_steps={args.prior_steps} rewarmup={args.rewarmup_steps} stop_at={stop_at}")
 
+    # For a grown phase, the optimizer-step budget is the UNCOUNTED warm-up preamble
+    # plus the remaining cosine (prior_steps -> total_steps). Compute it so the run ends
+    # exactly at the baseline horizon and the warm-up adds no counted steps.
+    phase_max_steps = args.max_steps
+    if args.prior_steps > 0 and total_steps > 0:
+        phase_max_steps = args.rewarmup_steps + (total_steps - args.prior_steps)
+        print(f"Grown phase: max_steps={phase_max_steps} "
+              f"(rewarmup {args.rewarmup_steps} + remaining {total_steps - args.prior_steps}); "
+              f"warm-up is not counted in the logged step.")
+
     targs = TrainingArguments(
         output_dir=args.out,
         per_device_train_batch_size=args.batch_size,
@@ -305,7 +374,7 @@ def main():
         weight_decay=args.weight_decay,
         warmup_steps=0,  # warmup handled by the custom unified scheduler
         num_train_epochs=args.epochs,
-        max_steps=args.max_steps,
+        max_steps=phase_max_steps,
         adam_beta1=0.9,
         adam_beta2=0.95,
         max_grad_norm=1.0,
@@ -339,7 +408,8 @@ def main():
         json.dump(run_cfg, f, indent=2)
 
     callbacks = [MetricLogger(args.log_file, n_params, tokens_per_step,
-                              args.prior_steps, args.prior_tokens, args.prior_flops)]
+                              args.prior_steps, args.prior_tokens, args.prior_flops,
+                              rewarmup_steps=args.rewarmup_steps)]
     if stop_at and stop_at > 0:
         callbacks.append(StopAtStep(stop_at))
 
@@ -352,6 +422,7 @@ def main():
         callbacks=callbacks,
     )
     trainer.set_schedule(total_steps, warmup_steps, args.prior_steps, args.rewarmup_steps)
+    trainer._sequential_data = sequential_data  # feed the permuted slice in order (phase-2)
 
     print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
