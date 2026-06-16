@@ -58,20 +58,56 @@ def geodesic(A, B, t):
     return torch.linalg.qr(G)[0][:, : A.shape[1]]  # re-orthonormalize float drift
 
 
-def interp_matrix(Wl, Wr, t):
-    """Interpolate a single weight matrix: geodesic frames + log-mean spectrum."""
+def slerp_cols(A, B, t):
+    """Spherical interpolation of each PAIRED column A[:,i] -> B[:,i] by fraction t.
+    A, B: (n, k) with unit columns. Returns (n, k) with re-normalized unit columns."""
+    dots = (A * B).sum(0).clamp(-1.0, 1.0)         # cos angle per column
+    th = torch.arccos(dots)
+    sin = torch.sin(th)
+    small = sin < 1e-6
+    wa = torch.where(small, torch.full_like(th, 1.0 - t), torch.sin((1.0 - t) * th) / sin)
+    wb = torch.where(small, torch.full_like(th, t),       torch.sin(t * th) / sin)
+    G = A * wa + B * wb
+    return G / G.norm(dim=0, keepdim=True).clamp_min(1e-12)
+
+
+def _interp_geodesic(Wl, Wr, t):
+    """DEFAULT: independent Stiefel geodesics on U and V (the original method)."""
     Wl64, Wr64 = Wl.double(), Wr.double()
     Ul, sl, Vlh = torch.linalg.svd(Wl64, full_matrices=False)
     Ur, sr, Vrh = torch.linalg.svd(Wr64, full_matrices=False)
     U = geodesic(Ul, Ur, t)
     V = geodesic(Vlh.T, Vrh.T, t)
-    s = torch.exp((1.0 - t) * torch.log(sl) + t * torch.log(sr))  # log/geom mean
-    W = (U * s) @ V.T
-    return W.to(Wl.dtype)
+    s = torch.exp((1.0 - t) * torch.log(sl) + t * torch.log(sr))   # log / geometric mean
+    return ((U * s) @ V.T).to(Wl.dtype)
+
+
+def _interp_paired(Wl, Wr, t):
+    """OPT-IN (--uv-align): slerp PAIRED singular triplets, keeping U and V CONSISTENT.
+
+    Triplets are paired by singular-value order and each triplet's joint sign is aligned
+    (flip u_i and v_i together), so the reassembly reduces to Wl at t=0 and Wr at t=1 --
+    endpoint-consistent, unlike _interp_geodesic which rotates U and V separately and
+    scrambles the U<->V correspondence (right spectrum, random singular directions)."""
+    Ul, sl, Vlh = torch.linalg.svd(Wl.double(), full_matrices=False)
+    Ur, sr, Vrh = torch.linalg.svd(Wr.double(), full_matrices=False)
+    Vl, Vr = Vlh.T, Vrh.T
+    sign = torch.sign((Ul * Ur).sum(0))            # align each triplet's sign (u & v together)
+    sign[sign == 0] = 1.0
+    Ur, Vr = Ur * sign, Vr * sign
+    U = slerp_cols(Ul, Ur, t)
+    V = slerp_cols(Vl, Vr, t)
+    s = torch.exp((1.0 - t) * torch.log(sl) + t * torch.log(sr))
+    return ((U * s) @ V.T).to(Wl.dtype)
+
+
+def interp_matrix(Wl, Wr, t, uv_align=False):
+    """Default = original geodesic; uv_align=True = U,V-consistent paired slerp."""
+    return _interp_paired(Wl, Wr, t) if uv_align else _interp_geodesic(Wl, Wr, t)
 
 
 @torch.no_grad()
-def interp_layer_state(sd_l, sd_r, t):
+def interp_layer_state(sd_l, sd_r, t, uv_align=False):
     """Build an inserted layer's state_dict from two neighbour state_dicts.
 
     2-D tensors (the 7 weight matrices) -> SVD interpolation.
@@ -81,7 +117,7 @@ def interp_layer_state(sd_l, sd_r, t):
     for k, vl in sd_l.items():
         vr = sd_r[k]
         if vl.ndim == 2:
-            out[k] = interp_matrix(vl, vr, t)
+            out[k] = interp_matrix(vl, vr, t, uv_align=uv_align)
         else:
             out[k] = (1.0 - t) * vl + t * vr
     return out
@@ -91,7 +127,7 @@ def interp_layer_state(sd_l, sd_r, t):
 # Build the grown model
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def grow(source_path, m, target_L, gated=True):
+def grow(source_path, m, target_L, gated=True, uv_align=False):
     src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
     src.eval()
     L = src.config.num_hidden_layers
@@ -160,7 +196,7 @@ def grow(source_path, m, target_L, gated=True):
         else:
             l, t = payload
             sd = interp_layer_state(src_layers[l].state_dict(),
-                                    src_layers[l + 1].state_dict(), t)
+                                    src_layers[l + 1].state_dict(), t, uv_align=uv_align)
             _load_layer(dst, sd)
     return src, new, plan
 
@@ -244,6 +280,9 @@ def main():
                    help="direct insert (Sec 4.4): inserted layers active from step 0, no alpha/beta "
                         "gates, no function preservation -- emits a plain Qwen2. Use to test whether "
                         "the zero-init gates are stalling and the new capacity never engages.")
+    p.add_argument("--uv-align", action="store_true",
+                   help="use the U,V-consistent paired-slerp interpolation (reconstructs endpoints) "
+                        "instead of the default independent-geodesic interpolation. OFF by default.")
     args = p.parse_args()
 
     if args.fold:
@@ -251,7 +290,7 @@ def main():
         return
 
     gated = not args.no_gate
-    src, new, plan = grow(args.source, args.m, args.target_L, gated=gated)
+    src, new, plan = grow(args.source, args.m, args.target_L, gated=gated, uv_align=args.uv_align)
     check_preservation(src, new, vocab=new.config.vocab_size, expect_zero=gated)
 
     os.makedirs(args.out, exist_ok=True)
