@@ -118,6 +118,24 @@ class GrowTrainer(Trainer):
         # alive and is symmetric across baseline/grown runs (same data+seed ->
         # same block skipped at the same step), so the comparison stays fair.
         opt = super().create_optimizer()
+
+        # Optional: put the alpha/beta gates in their OWN param group with a higher LR so
+        # they open faster (gate_lr = base_lr * gate_lr_mult). The cosine scheduler scales
+        # every group by the same factor, so this just raises the gates' base LR.
+        # gate_lr_mult == 1.0 -> skip entirely -> identical to the original single-LR setup.
+        mult = getattr(self, "_gate_lr_mult", 1.0)
+        if mult != 1.0:
+            gate_ids = {id(p) for n, p in self.model.named_parameters() if n.endswith(".gate")}
+            gates = []
+            for g in opt.param_groups:
+                gates += [p for p in g["params"] if id(p) in gate_ids]
+                g["params"] = [p for p in g["params"] if id(p) not in gate_ids]
+            if gates:
+                opt.add_param_group({"params": gates, "weight_decay": 0.0,
+                                     "lr": self.args.learning_rate * mult})
+                print(f"[gate-lr] {len(gates)} gate params in a separate group, "
+                      f"lr = {mult}x base = {self.args.learning_rate * mult:.2e}")
+
         self._skipped_nan_steps = 0
         trainer = self
         # Bind as a real method (via MethodType) rather than assigning a plain
@@ -145,7 +163,8 @@ class GrowTrainer(Trainer):
         if src:
             try:
                 from momentum_transfer import transfer_moments
-                transfer_moments(self.model, opt, src, self.get_decay_parameter_names)
+                transfer_moments(self.model, opt, src, self.get_decay_parameter_names,
+                                 warm_inserted=getattr(self, "_warm_inserted", False))
             except Exception as e:
                 print(f"[momentum transfer] FAILED ({e}); continuing with fresh optimizer.")
         return opt
@@ -282,6 +301,12 @@ def main():
                    help="warm-start AdamW moments from this source checkpoint's optimizer.pt: "
                         "kept/original layers + embeddings get the source moments, inserted layers "
                         "stay fresh. Mitigates the cold-optimizer slowdown after growth.")
+    p.add_argument("--warm-inserted", action="store_true",
+                   help="with --init-optimizer-from: also warm the INSERTED layers by interpolating "
+                        "their two neighbours' moments at the same t (mainly useful for --no-gate).")
+    p.add_argument("--gate-lr-mult", type=float, default=1.0,
+                   help="LR multiplier for the alpha/beta gate params (separate optimizer group). "
+                        "1.0 = identical to the original single-LR setup; >1 opens gates faster.")
     p.add_argument("--skip-samples", type=int, default=0,
                    help="phase-2: number of samples the prior phase consumed (overrides the "
                         "auto value prior_steps*batch_size*grad_accum). Normally leave 0 and just "
@@ -439,6 +464,8 @@ def main():
     trainer.set_schedule(total_steps, warmup_steps, args.prior_steps, args.rewarmup_steps)
     trainer._sequential_data = sequential_data  # feed the permuted slice in order (phase-2)
     trainer._init_opt_from = args.init_optimizer_from  # optional Adam-moment warm-start
+    trainer._warm_inserted = args.warm_inserted        # also warm inserted layers' moments
+    trainer._gate_lr_mult = args.gate_lr_mult          # separate (higher) LR for alpha/beta gates
 
     print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
