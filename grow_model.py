@@ -127,26 +127,47 @@ def interp_layer_state(sd_l, sd_r, t, uv_align=False):
 # Build the grown model
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def grow(source_path, m, target_L, gated=True, uv_align=False):
+def grow(source_path, total_insert, per_gap, gated=True, uv_align=False):
+    """Insert `total_insert` new layers, up to `per_gap` (>=2) per gap, filling gaps from
+    the LAST gap (between layers L-2 and L-1) backward toward the front."""
+    if per_gap < 1:
+        raise SystemExit(f"per_gap={per_gap} must be >= 1")
     src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
     src.eval()
     L = src.config.num_hidden_layers
-    inserted_per_gap = m - 1
-    interp_L = m * (L - 1) + 1
-    print(f"source layers L={L} | m={m} | interpolated L'={interp_L} | target={target_L}")
-    if target_L < interp_L:
-        raise SystemExit(f"target_L={target_L} < interpolated {interp_L}; raise target or lower m")
 
-    # --- plan the new stack: (kind, payload) per new layer ---
+    # Interpolation can fill at most (L-1) gaps x per_gap layers. Anything beyond that is
+    # handled at the BOUNDARY by copy-last layers -- you cannot interpolate past the last
+    # layer (Finding 3), so the overflow is copies of it.
+    capacity = (L - 1) * per_gap
+    n_interp = min(total_insert, capacity)
+    n_copy = total_insert - n_interp
+
+    # Distribute the interpolated inserts into gaps, from the back; <= per_gap per gap.
+    fill, remaining, l = {}, n_interp, L - 2
+    while remaining > 0 and l >= 0:
+        c = min(per_gap, remaining)
+        fill[l] = c
+        remaining -= c
+        l -= 1
+
+    # A gap with c inserts is subdivided into c+1 equal steps: t_j = j/(c+1), j=1..c.
     plan = []  # 'orig' -> source idx ; 'interp' -> (l, t) ; 'copy' -> source idx
     for l in range(L - 1):
         plan.append(("orig", l))
-        for j in range(1, m):
-            plan.append(("interp", (l, j / m)))
+        c = fill.get(l, 0)
+        for j in range(1, c + 1):
+            plan.append(("interp", (l, j / (c + 1))))
     plan.append(("orig", L - 1))
-    while len(plan) < target_L:                      # copy-last boundary layers (Sec 4.5)
+    for _ in range(n_copy):                          # copy-last boundary layers (Finding 3)
         plan.append(("copy", L - 1))
+    target_L = L + total_insert
     assert len(plan) == target_L
+    print(f"L={L} -> {target_L} | insert {total_insert}: {n_interp} interpolated "
+          f"(<= {per_gap}/gap, from back) + {n_copy} copy-last")
+    print(f"  gaps filled (gap between l and l+1 -> #inserts): {dict(sorted(fill.items()))}")
+    if n_copy:
+        print(f"  NOTE: interpolation capacity {capacity} exceeded; {n_copy} copy-last appended.")
 
     gated_layers = [i for i, (kind, _) in enumerate(plan) if kind != "orig"] if gated else []
     print(f"added layers ({'gated zero-init' if gated else 'DIRECT, no gate'}): "
@@ -272,8 +293,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--source", help="trained L-layer model dir / checkpoint to grow from")
     p.add_argument("--out", required=True, help="output dir for the grown (or folded) model")
-    p.add_argument("--m", type=int, default=2, help="subdivision factor (m=2 inserts 1 per gap)")
-    p.add_argument("--target-L", type=int, default=24, help="final number of layers")
+    p.add_argument("--total-insert", type=int, default=12, help="total number of layers to insert")
+    p.add_argument("--per-gap", type=int, default=2, help="inserts per gap (>=2); gaps filled from the back")
     p.add_argument("--fold", default=None,
                    help="deploy mode: path to a trained grown model to fold gates into a plain Qwen2")
     p.add_argument("--no-gate", action="store_true",
@@ -290,7 +311,8 @@ def main():
         return
 
     gated = not args.no_gate
-    src, new, plan = grow(args.source, args.m, args.target_L, gated=gated, uv_align=args.uv_align)
+    src, new, plan = grow(args.source, args.total_insert, args.per_gap,
+                          gated=gated, uv_align=args.uv_align)
     check_preservation(src, new, vocab=new.config.vocab_size, expect_zero=gated)
 
     os.makedirs(args.out, exist_ok=True)
