@@ -91,7 +91,7 @@ def interp_layer_state(sd_l, sd_r, t):
 # Build the grown model
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def grow(source_path, m, target_L):
+def grow(source_path, m, target_L, gated=True):
     src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
     src.eval()
     L = src.config.num_hidden_layers
@@ -112,29 +112,36 @@ def grow(source_path, m, target_L):
         plan.append(("copy", L - 1))
     assert len(plan) == target_L
 
-    gated_layers = [i for i, (kind, _) in enumerate(plan) if kind != "orig"]
-    print(f"added (gated, zero-init) layers: {gated_layers}")
+    gated_layers = [i for i, (kind, _) in enumerate(plan) if kind != "orig"] if gated else []
+    print(f"added layers ({'gated zero-init' if gated else 'DIRECT, no gate'}): "
+          f"{[i for i, (k, _) in enumerate(plan) if k != 'orig']}")
     print(f"  interpolated: {[i for i,(k,_) in enumerate(plan) if k=='interp']}")
     print(f"  copy-last   : {[i for i,(k,_) in enumerate(plan) if k=='copy']}")
 
-    # --- new gated config + empty model ---
-    # Drop the special keys so GatedQwen2Config keeps model_type="gated_qwen2"
-    # (otherwise the source's "qwen2" would override it and break auto_map routing).
+    # --- new config + empty model ---
+    # Drop the special keys so a custom model_type isn't overridden by the source's,
+    # and so per-layer fields (layer_types) regenerate at the new depth.
     cfg_dict = src.config.to_dict()
     for k in ("model_type", "architectures", "auto_map",
               "transformers_version", "_name_or_path", "layer_types"):
         cfg_dict.pop(k, None)
-    # Set depth BEFORE constructing so per-layer config fields (e.g. layer_types) are
-    # regenerated at the new length L' instead of staying at the source's L.
     cfg_dict["num_hidden_layers"] = target_L
-    cfg = GatedQwen2Config(**cfg_dict)
-    cfg.gated_layers = gated_layers
-    cfg.architectures = ["GatedQwen2ForCausalLM"]
-    cfg.auto_map = {
-        "AutoConfig": "modeling_gated_qwen2.GatedQwen2Config",
-        "AutoModelForCausalLM": "modeling_gated_qwen2.GatedQwen2ForCausalLM",
-    }
-    new = GatedQwen2ForCausalLM(cfg)
+    if gated:
+        cfg = GatedQwen2Config(**cfg_dict)
+        cfg.gated_layers = gated_layers
+        cfg.architectures = ["GatedQwen2ForCausalLM"]
+        cfg.auto_map = {
+            "AutoConfig": "modeling_gated_qwen2.GatedQwen2Config",
+            "AutoModelForCausalLM": "modeling_gated_qwen2.GatedQwen2ForCausalLM",
+        }
+        new = GatedQwen2ForCausalLM(cfg)
+    else:
+        # direct insert (Sec 4.4 ablation): a plain Qwen2, inserted layers active from
+        # step 0 -- no function preservation, but the new capacity engages immediately.
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+        cfg = Qwen2Config(**cfg_dict)
+        cfg.architectures = ["Qwen2ForCausalLM"]
+        new = Qwen2ForCausalLM(cfg)
     new.eval()
 
     # embeddings / final norm / lm_head straight from source
@@ -179,17 +186,21 @@ def _load_layer(dst_layer, plain_sd):
 # Function-preservation check
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def check_preservation(src, new, vocab, seq=64, bsz=2, seed=0):
+def check_preservation(src, new, vocab, seq=64, bsz=2, seed=0, expect_zero=True):
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(0, vocab, (bsz, seq), generator=g)
     src_loss = src(input_ids=ids, labels=ids).loss.item()
     new_loss = new(input_ids=ids, labels=ids).loss.item()
-    print(f"\n[function preservation] source loss = {src_loss:.6f} | "
+    print(f"\n[init check] source loss = {src_loss:.6f} | "
           f"grown loss = {new_loss:.6f} | gap = {abs(src_loss-new_loss):.2e}")
-    if abs(src_loss - new_loss) > 1e-3:
-        print("  WARNING: gap is not ~0 -- gates/wiring are wrong, DO NOT train yet.")
+    if expect_zero:
+        if abs(src_loss - new_loss) > 1e-3:
+            print("  WARNING: gap is not ~0 -- gates/wiring are wrong, DO NOT train yet.")
+        else:
+            print("  OK: gated deep model computes the same function at step 0.")
     else:
-        print("  OK: deep model computes the same function at step 0.")
+        print("  direct insert: a small gap is EXPECTED (no function preservation); the inserted "
+              "layers are active from step 0. Lower gap = better interpolated init.")
 
 
 # ---------------------------------------------------------------------------
@@ -229,21 +240,29 @@ def main():
     p.add_argument("--target-L", type=int, default=24, help="final number of layers")
     p.add_argument("--fold", default=None,
                    help="deploy mode: path to a trained grown model to fold gates into a plain Qwen2")
+    p.add_argument("--no-gate", action="store_true",
+                   help="direct insert (Sec 4.4): inserted layers active from step 0, no alpha/beta "
+                        "gates, no function preservation -- emits a plain Qwen2. Use to test whether "
+                        "the zero-init gates are stalling and the new capacity never engages.")
     args = p.parse_args()
 
     if args.fold:
         fold_gates(args.fold, args.out)
         return
 
-    src, new, plan = grow(args.source, args.m, args.target_L)
-    check_preservation(src, new, vocab=new.config.vocab_size)
+    gated = not args.no_gate
+    src, new, plan = grow(args.source, args.m, args.target_L, gated=gated)
+    check_preservation(src, new, vocab=new.config.vocab_size, expect_zero=gated)
 
     os.makedirs(args.out, exist_ok=True)
     new.save_pretrained(args.out)
     AutoTokenizer.from_pretrained(args.source).save_pretrained(args.out)
-    shutil.copy(os.path.join(HERE, "modeling_gated_qwen2.py"),
-                os.path.join(args.out, "modeling_gated_qwen2.py"))
-    print(f"\ngrown model saved to {args.out}  (load with trust_remote_code=True)")
+    if gated:
+        shutil.copy(os.path.join(HERE, "modeling_gated_qwen2.py"),
+                    os.path.join(args.out, "modeling_gated_qwen2.py"))
+        print(f"\ngrown (gated) model saved to {args.out}  (load with trust_remote_code=True)")
+    else:
+        print(f"\ngrown (direct, no-gate) model saved to {args.out}  (plain Qwen2)")
 
 
 if __name__ == "__main__":
