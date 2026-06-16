@@ -34,6 +34,8 @@ PRESETS = {
     "fineweb": dict(path="HuggingFaceFW/fineweb", name="sample-10BT", split="train", text="text", stream=True),
     "chinese-fineweb": dict(path="opencsg/chinese-fineweb-edu", name=None, split="train", text="text", stream=True),
     "skypile": dict(path="Skywork/SkyPile-150B", name=None, split="train", text="text", stream=True),
+    "slimpajama": dict(path="cerebras/SlimPajama-627B", name=None, split="train", text="text", stream=True),
+    "slimpajama-6b": dict(path="DKYoon/SlimPajama-6B", name=None, split="train", text="text"),
     "wikitext": dict(path="Salesforce/wikitext", name="wikitext-103-raw-v1", split="train", text="text"),
     "tinystories": dict(path="roneneldan/TinyStories", name=None, split="train", text="text"),
 }
