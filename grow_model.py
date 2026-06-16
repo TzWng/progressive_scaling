@@ -122,10 +122,12 @@ def grow(source_path, m, target_L):
     # (otherwise the source's "qwen2" would override it and break auto_map routing).
     cfg_dict = src.config.to_dict()
     for k in ("model_type", "architectures", "auto_map",
-              "transformers_version", "_name_or_path"):
+              "transformers_version", "_name_or_path", "layer_types"):
         cfg_dict.pop(k, None)
+    # Set depth BEFORE constructing so per-layer config fields (e.g. layer_types) are
+    # regenerated at the new length L' instead of staying at the source's L.
+    cfg_dict["num_hidden_layers"] = target_L
     cfg = GatedQwen2Config(**cfg_dict)
-    cfg.num_hidden_layers = target_L
     cfg.gated_layers = gated_layers
     cfg.architectures = ["GatedQwen2ForCausalLM"]
     cfg.auto_map = {
