@@ -222,6 +222,38 @@ def grow(source_path, total_insert, per_gap, gated=True, uv_align=False):
     return src, new, plan
 
 
+@torch.no_grad()
+def stack_grow(source_path, total_insert):
+    """G_stack baseline (Du et al. 2024): plain depthwise stacking -- the grown layer i takes
+    the weights of source layer (i mod L). Pure copy-paste, no interpolation, no gates; the
+    deeper model is the L-layer block tiled. This is ONLY the core G_stack init operator (for
+    a fair comparison), not their LR / growth-timing recipe."""
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
+    src.eval()
+    L = src.config.num_hidden_layers
+    target_L = L + total_insert
+    cfg_dict = src.config.to_dict()
+    for k in ("model_type", "architectures", "auto_map",
+              "transformers_version", "_name_or_path", "layer_types"):
+        cfg_dict.pop(k, None)
+    cfg_dict["num_hidden_layers"] = target_L
+    cfg = Qwen2Config(**cfg_dict)
+    cfg.architectures = ["Qwen2ForCausalLM"]
+    new = Qwen2ForCausalLM(cfg)
+    new.eval()
+    new.model.embed_tokens.load_state_dict(src.model.embed_tokens.state_dict())
+    new.model.norm.load_state_dict(src.model.norm.state_dict())
+    if not cfg.tie_word_embeddings:
+        new.lm_head.load_state_dict(src.lm_head.state_dict())
+    new.tie_weights()
+    for i in range(target_L):
+        new.model.layers[i].load_state_dict(src.model.layers[i % L].state_dict())
+    print(f"G_stack: L={L} -> {target_L} | grown layer i <- source layer (i mod {L})")
+    print(f"  layer mapping: {[i % L for i in range(target_L)]}")
+    return src, new, None
+
+
 def _load_layer(dst_layer, plain_sd):
     """Load a *plain* (ungated) layer state_dict into dst, which may have
     GatedLinear-wrapped o_proj/down_proj. Remaps `<x>.weight` -> `<x>.base.weight`
@@ -304,6 +336,9 @@ def main():
     p.add_argument("--uv-align", action="store_true",
                    help="use the U,V-consistent paired-slerp interpolation (reconstructs endpoints) "
                         "instead of the default independent-geodesic interpolation. OFF by default.")
+    p.add_argument("--gstack", action="store_true",
+                   help="G_stack baseline: plain depthwise stacking (copy-paste, layer i <- i mod L), "
+                        "no interpolation/gates. For a fair comparison against the interpolation method.")
     args = p.parse_args()
 
     if args.fold:
@@ -311,8 +346,12 @@ def main():
         return
 
     gated = not args.no_gate
-    src, new, plan = grow(args.source, args.total_insert, args.per_gap,
-                          gated=gated, uv_align=args.uv_align)
+    if args.gstack:
+        gated = False
+        src, new, plan = stack_grow(args.source, args.total_insert)
+    else:
+        src, new, plan = grow(args.source, args.total_insert, args.per_gap,
+                              gated=gated, uv_align=args.uv_align)
     check_preservation(src, new, vocab=new.config.vocab_size, expect_zero=gated)
 
     os.makedirs(args.out, exist_ok=True)
