@@ -37,7 +37,7 @@ from transformers import (
 )
 
 
-def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps):
+def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps, min_lr_ratio=0.0):
     """One warmup+cosine schedule spanning `total_steps` (GLOBAL horizon).
 
     Returns a function of the LOCAL step within the current phase. The global
@@ -57,7 +57,8 @@ def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps):
             return g / max(1, warmup_steps)
         prog = (g - warmup_steps) / max(1, total_steps - warmup_steps)
         prog = min(1.0, max(0.0, prog))
-        return 0.5 * (1.0 + math.cos(math.pi * prog))
+        # cosine from 1.0 down to min_lr_ratio (the floor), not to 0
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * prog))
 
     def lr_lambda(local_step):
         if rewarmup_steps > 0 and local_step < rewarmup_steps:
@@ -77,9 +78,10 @@ def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps):
 class GrowTrainer(Trainer):
     """Trainer that installs the unified warmup+cosine schedule above."""
 
-    def set_schedule(self, total_steps, warmup_steps, prior_steps, rewarmup_steps):
+    def set_schedule(self, total_steps, warmup_steps, prior_steps, rewarmup_steps, min_lr_ratio=0.0):
         self._sched = dict(total_steps=total_steps, warmup_steps=warmup_steps,
-                           prior_steps=prior_steps, rewarmup_steps=rewarmup_steps)
+                           prior_steps=prior_steps, rewarmup_steps=rewarmup_steps,
+                           min_lr_ratio=min_lr_ratio)
 
     def get_decay_parameter_names(self, model):
         # Keep weight decay OFF for the zero-init residual gates (alpha/beta):
@@ -106,7 +108,8 @@ class GrowTrainer(Trainer):
             total = s["total_steps"] if s["total_steps"] > 0 else s["prior_steps"] + num_training_steps
             self.lr_scheduler = LambdaLR(
                 opt,
-                make_lr_lambda(total, s["warmup_steps"], s["prior_steps"], s["rewarmup_steps"]),
+                make_lr_lambda(total, s["warmup_steps"], s["prior_steps"], s["rewarmup_steps"],
+                               s["min_lr_ratio"]),
             )
         return self.lr_scheduler
 
@@ -260,6 +263,9 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--warmup-ratio", type=float, default=0.02)
+    p.add_argument("--min-lr-ratio", type=float, default=0.0,
+                   help="cosine floors at this fraction of peak LR instead of decaying to 0 "
+                        "(e.g. 0.1 = G_stack's min-LR = 10%% of max-LR). 0.0 = decay to 0.")
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help="override epochs; -1 disables")
     p.add_argument("--save-steps", type=int, default=1000)
@@ -461,7 +467,8 @@ def main():
         processing_class=tok,
         callbacks=callbacks,
     )
-    trainer.set_schedule(total_steps, warmup_steps, args.prior_steps, args.rewarmup_steps)
+    trainer.set_schedule(total_steps, warmup_steps, args.prior_steps, args.rewarmup_steps,
+                         min_lr_ratio=args.min_lr_ratio)
     trainer._sequential_data = sequential_data  # feed the permuted slice in order (phase-2)
     trainer._init_opt_from = args.init_optimizer_from  # optional Adam-moment warm-start
     trainer._warm_inserted = args.warm_inserted        # also warm inserted layers' moments
