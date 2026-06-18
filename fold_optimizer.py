@@ -9,29 +9,29 @@ CONTINUE training without a cold optimizer, the Adam moments must be carried acr
     parameterisation is g' = g_base/alpha, so the moments transform as
         exp_avg    (m) ->  m / alpha
         exp_avg_sq (v) ->  v / alpha^2
-    (and beta for down_proj). This makes the loaded moments consistent with the post-fold
-    gradients. Adam's update is scale-invariant, so even without this rescale the FIRST step
-    would be ~correct -- but rescaling keeps the EMA on the right scale through the transition.
+    (and beta for down_proj). This keeps the loaded moments on the right scale post-fold.
   * every other parameter (q/k/v_proj, norms, embeddings, lm_head, and any UNgated original
     layer's o_proj/down_proj) is copied unchanged.
 
-It writes `<folded_dir>/optimizer.pt` over the FOLDED model's [decay, no-decay] param groups,
-so the existing `train.py --init-optimizer-from <folded_dir>` (momentum_transfer.transfer_moments)
-picks it up by name and warm-starts the continued run.
+It writes `<folded_dir>/optimizer.pt` over the FOLDED model's param groups so the existing
+`train.py --init-optimizer-from <folded_dir>` (momentum_transfer.transfer_moments) picks it up
+by name and warm-starts the continued run.
+
+Robustness: the AdamW decay/no-decay split differs across transformers versions (newer ones
+also exclude embeddings from decay). Rather than hard-code it, we INFER the split that matches
+the saved optimizer's group sizes, and reuse the same rule on the folded side -- so it stays
+consistent with whatever transfer_moments rebuilds.
 
 Inputs / output:
-    --source : INPUT  the gated checkpoint (has optimizer.pt + the gate values to rescale by)
+    --source : INPUT  the gated checkpoint (its optimizer.pt + gate values)
     --folded : INPUT  the folded model dir from fold_model.py (read for its param structure)
-               OUTPUT  optimizer.pt is WRITTEN into this same dir, ready for --init-optimizer-from
+               OUTPUT optimizer.pt is WRITTEN into this same dir, for --init-optimizer-from
 
 Usage:
-    python fold_model.py     --source <gated_ckpt> --out    <folded_dir>   # 1) fold the weights
-    python fold_optimizer.py --source <gated_ckpt> --folded <folded_dir>   # 2) fold the moments
+    python fold_model.py     --source <gated_ckpt> --out    <folded_dir>
+    python fold_optimizer.py --source <gated_ckpt> --folded <folded_dir>
     python train.py --model <folded_dir> --prior-steps <global_step> ... \
-                    --init-optimizer-from <folded_dir>                      # 3) continue, moments warm
-
-Assumes the gated run used --gate-lr-mult 1.0 (gates share the no-decay group) OR >1.0
-(gates in a separate 3rd group); both are detected from optimizer.pt automatically.
+                    --init-optimizer-from <folded_dir>
 """
 import argparse
 import os
@@ -50,30 +50,49 @@ except Exception:                                            # pragma: no cover 
 GATE_EPS = 1e-8        # |gate| below this: skip transfer (folded weight ~0) -> that param starts fresh
 
 
-def decay_names(model):
-    """HF default decay set (2-D weights, excluding norms + biases), minus the .gate scalars --
-    identical to train.py's get_decay_parameter_names."""
-    names = get_parameter_names(model, ALL_LAYERNORM_LAYERS)
-    return {n for n in names if "bias" not in n and not n.endswith(".gate")}
+def _decay_set(model, exclude_embed):
+    """Names that get weight decay, mirroring HF's get_decay_parameter_names (minus .gate).
+    `exclude_embed` toggles the newer-transformers behaviour of also dropping embeddings."""
+    names = set(get_parameter_names(model, ALL_LAYERNORM_LAYERS))
+    out = set()
+    for n in names:
+        if "bias" in n or n.endswith(".gate"):
+            continue
+        if exclude_embed and ("embed_tokens" in n or n.endswith("lm_head.weight")):
+            continue
+        out.add(n)
+    return out
 
 
-def _build_groups(model, n_groups):
-    """Rebuild the param groups in the SAME order the trainer used, so optimizer.pt loads."""
-    decay = decay_names(model)
+def _grouped_named(model, n_groups, exclude_embed):
+    """Params as (name, param) lists per group, in the SAME order the HF trainer builds them:
+    [decay], [no-decay] (+ [gates] when the gated run used --gate-lr-mult > 1)."""
+    decay = _decay_set(model, exclude_embed)
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    g0 = [p for n, p in named if n in decay]                          # decayed weights
-    if n_groups == 3:                                                # gate-lr-mult > 1: gates split off
-        g1 = [p for n, p in named if n not in decay and not n.endswith(".gate")]
-        g2 = [p for n, p in named if n.endswith(".gate")]
-        return [{"params": g0}, {"params": g1}, {"params": g2}]
-    g1 = [p for n, p in named if n not in decay]                      # no-decay (incl. gates if mult==1)
-    return [{"params": g0}, {"params": g1}]
+    g0 = [(n, p) for n, p in named if n in decay]
+    if n_groups == 3:                                        # gate-lr-mult > 1: gates split off
+        g1 = [(n, p) for n, p in named if n not in decay and not n.endswith(".gate")]
+        g2 = [(n, p) for n, p in named if n.endswith(".gate")]
+        return [g0, g1, g2]
+    g1 = [(n, p) for n, p in named if n not in decay]        # no-decay (incl. gates if mult == 1)
+    return [g0, g1]
+
+
+def _infer_exclude_embed(model, sizes):
+    """Find the decay rule (exclude embeddings or not) whose per-group sizes match the saved
+    optimizer `sizes`. Returns (exclude_embed, flat) where flat is (name, param) in index order."""
+    for exclude_embed in (False, True):
+        groups = _grouped_named(model, len(sizes), exclude_embed)
+        if [len(g) for g in groups] == list(sizes):
+            return exclude_embed, [x for g in groups for x in g]
+    raise SystemExit(
+        f"could not reproduce optimizer param-group sizes {sizes}: the decay split of this "
+        f"transformers version doesn't match either candidate rule. Inspect optimizer.pt.")
 
 
 @torch.no_grad()
 def load_moments(gated_ckpt):
-    """Return {param_name -> {exp_avg, exp_avg_sq, step}} for the gated checkpoint, plus the
-    per-layer (alpha, beta) gate values."""
+    """Return {param_name -> state}, per-layer (alpha, beta) gates, and the inferred decay rule."""
     opt_path = os.path.join(gated_ckpt, "optimizer.pt")
     if not os.path.exists(opt_path):
         raise SystemExit(f"no optimizer.pt in {gated_ckpt}")
@@ -82,44 +101,45 @@ def load_moments(gated_ckpt):
                                               torch_dtype=torch.float32)
     gm.eval()
     sd = torch.load(opt_path, map_location="cpu")
-    opt = torch.optim.AdamW(_build_groups(gm, len(sd["param_groups"])), lr=1e-3)
-    opt.load_state_dict(sd)
+    sizes = [len(g["params"]) for g in sd["param_groups"]]
+    exclude_embed, flat = _infer_exclude_embed(gm, sizes)    # index -> (name, param)
+    M = {flat[i][0]: st for i, st in sd["state"].items() if i < len(flat)}
 
-    id2name = {id(p): n for n, p in gm.named_parameters()}
-    M = {id2name[id(p)]: st for p, st in opt.state.items() if id(p) in id2name}
-
-    gates = {}                                                       # layer idx -> (alpha, beta)
+    gates = {}                                               # layer idx -> (alpha, beta)
     for i, layer in enumerate(gm.model.layers):
         a = getattr(layer.self_attn.o_proj, "gate", None)
         b = getattr(layer.mlp.down_proj, "gate", None)
         gates[i] = (None if a is None else float(a),
                     None if b is None else float(b))
-    del gm, opt
-    return M, gates
+    del gm
+    return M, gates, sizes, exclude_embed
 
 
 @torch.no_grad()
 def fold_optimizer(gated_ckpt, folded_dir):
-    M, gates = load_moments(gated_ckpt)
+    M, gates, sizes, exclude_embed = load_moments(gated_ckpt)
     folded = Qwen2ForCausalLM.from_pretrained(folded_dir, torch_dtype=torch.float32)
     folded.eval()
 
-    opt = torch.optim.AdamW(_build_groups(folded, 2), lr=1e-3)       # plain model: [decay, no-decay]
-    layer_re = re.compile(r"model\.layers\.(\d+)\.")
+    # Build the folded model's [decay, no-decay] groups with the SAME decay rule inferred from
+    # the gated optimizer, so the saved optimizer.pt round-trips through transfer_moments.
+    folded_groups = _grouped_named(folded, 2, exclude_embed)
+    opt = torch.optim.AdamW([{"params": [p for _, p in grp]} for grp in folded_groups], lr=1e-3)
 
+    layer_re = re.compile(r"model\.layers\.(\d+)\.")
     n_copy = n_scaled = n_skip = 0
     for name, p in folded.named_parameters():
-        src_key, sm, sv = name, 1.0, 1.0                            # default: copy unchanged
+        src_key, sm, sv = name, 1.0, 1.0                     # default: copy unchanged
         m = layer_re.match(name)
         if m and (name.endswith("self_attn.o_proj.weight") or name.endswith("mlp.down_proj.weight")):
             li = int(m.group(1))
             is_o = name.endswith("self_attn.o_proj.weight")
             gate = gates.get(li, (None, None))[0 if is_o else 1]
-            if gate is not None:                                    # this layer was gated -> rescale
+            if gate is not None:                             # this layer was gated -> rescale
                 if abs(gate) < GATE_EPS:
                     n_skip += 1
                     continue
-                src_key = name.replace(".weight", ".base.weight")   # gated stored it under .base.weight
+                src_key = name.replace(".weight", ".base.weight")
                 sm, sv = 1.0 / gate, 1.0 / (gate * gate)
 
         st = M.get(src_key)
@@ -131,15 +151,15 @@ def fold_optimizer(gated_ckpt, folded_dir):
             "exp_avg": st["exp_avg"].clone().mul_(sm),
             "exp_avg_sq": st["exp_avg_sq"].clone().mul_(sv),
         }
-        n_scaled += sm != 1.0
-        n_copy += sm == 1.0
+        n_scaled += int(sm != 1.0)
+        n_copy += int(sm == 1.0)
 
     out_path = os.path.join(folded_dir, "optimizer.pt")
     torch.save(opt.state_dict(), out_path)
     print(f"folded optimizer -> {out_path}")
-    print(f"  copied {n_copy} params | rescaled {n_scaled} o_proj/down_proj | "
-          f"skipped {n_skip} (|gate|<{GATE_EPS})")
-    print(f"  resume with: train.py --model {folded_dir} --init-optimizer-from {folded_dir} ...")
+    print(f"  source optimizer groups {sizes} | copied {n_copy} | "
+          f"rescaled {n_scaled} o_proj/down_proj | skipped {n_skip} (|gate|<{GATE_EPS})")
+    print(f"  resume: train.py --model {folded_dir} --init-optimizer-from {folded_dir} ...")
 
 
 if __name__ == "__main__":
@@ -148,6 +168,6 @@ if __name__ == "__main__":
     ap.add_argument("--source", required=True,
                     help="INPUT: gated checkpoint (its optimizer.pt + gate values)")
     ap.add_argument("--folded", required=True,
-                    help="INPUT+OUTPUT: folded model dir from fold_model.py; optimizer.pt is written here")
+                    help="INPUT+OUTPUT: folded model dir from fold_model.py; optimizer.pt written here")
     args = ap.parse_args()
     fold_optimizer(args.source, args.folded)
