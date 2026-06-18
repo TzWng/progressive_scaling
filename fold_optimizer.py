@@ -17,10 +17,11 @@ It writes `<folded_dir>/optimizer.pt` over the FOLDED model's param groups so th
 `train.py --init-optimizer-from <folded_dir>` (momentum_transfer.transfer_moments) picks it up
 by name and warm-starts the continued run.
 
-Robustness: the AdamW decay/no-decay split differs across transformers versions (newer ones
-also exclude embeddings from decay). Rather than hard-code it, we INFER the split that matches
-the saved optimizer's group sizes, and reuse the same rule on the folded side -- so it stays
-consistent with whatever transfer_moments rebuilds.
+Mapping the saved (index-keyed) optimizer state back to parameter NAMES needs the trainer's
+exact decay / no-decay split. We do NOT hand-roll that rule (it varies across transformers
+versions); we call the SAME function train.py uses -- HF's Trainer.get_decay_parameter_names --
+and apply train.py's only customisation: the .gate scalars are no-decay. The one structural
+distinction this tool makes is therefore alpha/beta (gates) vs everything else.
 
 Inputs / output:
     --source : INPUT  the gated checkpoint (its optimizer.pt + gate values)
@@ -50,24 +51,23 @@ except Exception:                                            # pragma: no cover 
 GATE_EPS = 1e-8        # |gate| below this: skip transfer (folded weight ~0) -> that param starts fresh
 
 
-def _decay_set(model, exclude_embed):
-    """Names that get weight decay, mirroring HF's get_decay_parameter_names (minus .gate).
-    `exclude_embed` toggles the newer-transformers behaviour of also dropping embeddings."""
-    names = set(get_parameter_names(model, ALL_LAYERNORM_LAYERS))
-    out = set()
-    for n in names:
-        if "bias" in n or n.endswith(".gate"):
-            continue
-        if exclude_embed and ("embed_tokens" in n or n.endswith("lm_head.weight")):
-            continue
-        out.add(n)
-    return out
+def decay_names(model):
+    """train.py's decay set, EXACTLY: the installed HF Trainer's get_decay_parameter_names, minus
+    the .gate scalars. Calling the real function (instead of a hand-rolled rule) keeps us in
+    lockstep with whatever split the trainer used to SAVE optimizer.pt, across versions. The only
+    custom distinction is gates (alpha/beta) -> no-decay."""
+    try:
+        from transformers import Trainer
+        base = list(Trainer.get_decay_parameter_names(None, model))   # self unused -> None is fine
+    except Exception:                                                 # pragma: no cover - fallback
+        base = [n for n in get_parameter_names(model, ALL_LAYERNORM_LAYERS) if "bias" not in n]
+    return {n for n in base if not n.endswith(".gate")}
 
 
-def _grouped_named(model, n_groups, exclude_embed):
+def _grouped_named(model, n_groups):
     """Params as (name, param) lists per group, in the SAME order the HF trainer builds them:
     [decay], [no-decay] (+ [gates] when the gated run used --gate-lr-mult > 1)."""
-    decay = _decay_set(model, exclude_embed)
+    decay = decay_names(model)
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     g0 = [(n, p) for n, p in named if n in decay]
     if n_groups == 3:                                        # gate-lr-mult > 1: gates split off
@@ -78,21 +78,9 @@ def _grouped_named(model, n_groups, exclude_embed):
     return [g0, g1]
 
 
-def _infer_exclude_embed(model, sizes):
-    """Find the decay rule (exclude embeddings or not) whose per-group sizes match the saved
-    optimizer `sizes`. Returns (exclude_embed, flat) where flat is (name, param) in index order."""
-    for exclude_embed in (False, True):
-        groups = _grouped_named(model, len(sizes), exclude_embed)
-        if [len(g) for g in groups] == list(sizes):
-            return exclude_embed, [x for g in groups for x in g]
-    raise SystemExit(
-        f"could not reproduce optimizer param-group sizes {sizes}: the decay split of this "
-        f"transformers version doesn't match either candidate rule. Inspect optimizer.pt.")
-
-
 @torch.no_grad()
 def load_moments(gated_ckpt):
-    """Return {param_name -> state}, per-layer (alpha, beta) gates, and the inferred decay rule."""
+    """Return {param_name -> state} for the gated checkpoint + per-layer (alpha, beta) gates."""
     opt_path = os.path.join(gated_ckpt, "optimizer.pt")
     if not os.path.exists(opt_path):
         raise SystemExit(f"no optimizer.pt in {gated_ckpt}")
@@ -102,7 +90,13 @@ def load_moments(gated_ckpt):
     gm.eval()
     sd = torch.load(opt_path, map_location="cpu")
     sizes = [len(g["params"]) for g in sd["param_groups"]]
-    exclude_embed, flat = _infer_exclude_embed(gm, sizes)    # index -> (name, param)
+    groups = _grouped_named(gm, len(sizes))
+    got = [len(g) for g in groups]
+    if got != sizes:
+        raise SystemExit(
+            f"reconstructed param-group sizes {got} != saved {sizes}. The decay split could not be "
+            f"reproduced from Trainer.get_decay_parameter_names -- check the transformers version.")
+    flat = [x for g in groups for x in g]                    # index -> (name, param)
     M = {flat[i][0]: st for i, st in sd["state"].items() if i < len(flat)}
 
     gates = {}                                               # layer idx -> (alpha, beta)
@@ -112,18 +106,17 @@ def load_moments(gated_ckpt):
         gates[i] = (None if a is None else float(a),
                     None if b is None else float(b))
     del gm
-    return M, gates, sizes, exclude_embed
+    return M, gates, sizes
 
 
 @torch.no_grad()
 def fold_optimizer(gated_ckpt, folded_dir):
-    M, gates, sizes, exclude_embed = load_moments(gated_ckpt)
+    M, gates, sizes = load_moments(gated_ckpt)
     folded = Qwen2ForCausalLM.from_pretrained(folded_dir, torch_dtype=torch.float32)
     folded.eval()
 
-    # Build the folded model's [decay, no-decay] groups with the SAME decay rule inferred from
-    # the gated optimizer, so the saved optimizer.pt round-trips through transfer_moments.
-    folded_groups = _grouped_named(folded, 2, exclude_embed)
+    # Folded model has no gates -> plain [decay, no-decay]; same decay function transfer_moments uses.
+    folded_groups = _grouped_named(folded, 2)
     opt = torch.optim.AdamW([{"params": [p for _, p in grp]} for grp in folded_groups], lr=1e-3)
 
     layer_re = re.compile(r"model\.layers\.(\d+)\.")
