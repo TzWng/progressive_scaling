@@ -1,16 +1,19 @@
 """Warm-start the grown model's AdamW with the source (small) model's Adam moments.
 
-For every grown parameter that is an EXACT copy of a source parameter -- the kept original
-layers (detected by exact weight equality), plus embeddings / final norm / lm_head -- copy
-the source's (exp_avg, exp_avg_sq, step) into the grown optimizer's state. Interpolated and
-copy-last layers, which have no exact source counterpart, are left fresh (zero moments).
+- KEPT / copy-last layers (detected by exact weight equality) + embeddings / norm / lm_head:
+  copy the source moments directly.
+- INSERTED (interpolated) layers, when warm_inserted=True: give each inserted layer moments
+  interpolated from its two neighbour source layers at the SAME fraction t used for its
+  weights -- second moment v (exp_avg_sq, positive) by log/geometric interp (matching the
+  spectrum), first moment m (exp_avg, signed) by linear interp. Handles MULTIPLE inserts per
+  gap: a run of c inserts between two kept layers gets t = 1/(c+1), 2/(c+1), ..., c/(c+1).
 
-This preserves the training dynamics of the reused weights (cf. Staged Training), so the
-grown model does not pay the cold-Adam slowdown on its original layers after growth.
+The plan is reconstructed purely from weight matching: kept/copy layers match a source layer
+exactly; inserted layers match nothing, and a maximal run of unmatched layers sits between two
+kept layers whose source indices are its interpolation neighbours.
 
-Robustness: the whole thing is best-effort. The caller wraps it in try/except, and it prints
-how many parameters / layers were matched so the transfer can be verified before trusting any
-result. A wrong mapping would corrupt training silently, so DO check the printed counts.
+Note: for the gated model, inserted layers have gate=0 so their gradients (hence moments) are
+moot until the gate opens -- warm_inserted mainly helps the no-gate (direct insert) variant.
 """
 import os
 import torch
@@ -18,32 +21,39 @@ from transformers import AutoModelForCausalLM
 
 
 @torch.no_grad()
-def transfer_moments(grown_model, optimizer, source_ckpt, decay_fn):
+def transfer_moments(grown_model, optimizer, source_ckpt, decay_fn, warm_inserted=False):
     opt_path = os.path.join(source_ckpt, "optimizer.pt")
     if not os.path.exists(opt_path):
-        print(f"[momentum transfer] no optimizer.pt in {source_ckpt}; skipping (fresh optimizer).")
+        print(f"[momentum transfer] no optimizer.pt in {source_ckpt}; skipping.")
         return
 
     src = AutoModelForCausalLM.from_pretrained(source_ckpt, torch_dtype=torch.float32)
     src.eval()
-
-    # Rebuild the source optimizer with the SAME param grouping (decay first, then no-decay),
-    # load its saved state, then read moments keyed by parameter NAME. PyTorch's
-    # load_state_dict maps the saved integer indices onto these params by group order, so as
-    # long as the grouping matches training, each moment lands on the right parameter.
     decay = set(decay_fn(src))
     g0 = [p for n, p in src.named_parameters() if n in decay and p.requires_grad]
     g1 = [p for n, p in src.named_parameters() if n not in decay and p.requires_grad]
     src_opt = torch.optim.AdamW([{"params": g0}, {"params": g1}], lr=1e-3)
     src_opt.load_state_dict(torch.load(opt_path, map_location="cpu"))
     id2name = {id(p): n for n, p in src.named_parameters()}
-    name_moments = {id2name[id(p)]: st for p, st in src_opt.state.items() if id(p) in id2name}
+    M = {id2name[id(p)]: st for p, st in src_opt.state.items() if id(p) in id2name}
 
-    # Match each grown decoder layer to a source layer by EXACT q_proj weight equality
-    # (kept/copy layers are byte-exact copies; interpolated layers match nothing).
+    grown_named = dict(grown_model.named_parameters())
     src_layers = src.model.layers
 
-    def match_layer(gl):
+    def plain(sub):                                   # gated o_proj.base.weight -> o_proj.weight
+        return sub.replace(".base.weight", ".weight")
+
+    def set_state(gn, m, v, step):
+        gp = grown_named.get(gn)
+        if gp is None or v.shape != gp.shape:
+            return 0
+        st = step.clone() if torch.is_tensor(step) else torch.tensor(float(step))
+        optimizer.state[gp] = {"step": st.to(gp.device),
+                               "exp_avg": m.to(gp.device).clone(),
+                               "exp_avg_sq": v.to(gp.device).clone()}
+        return 1
+
+    def match(gl):                                    # grown layer -> source idx (exact) or None
         gw = gl.self_attn.q_proj.weight.data.cpu()
         for j, sl in enumerate(src_layers):
             sw = sl.self_attn.q_proj.weight.data.cpu()
@@ -51,37 +61,48 @@ def transfer_moments(grown_model, optimizer, source_ckpt, decay_fn):
                 return j
         return None
 
-    grown_to_src = {}
-    for shared in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
-        if shared in name_moments:
-            grown_to_src[shared] = shared
-    n_layers = 0
-    for i, gl in enumerate(grown_model.model.layers):
-        j = match_layer(gl)
-        if j is None:
-            continue
-        n_layers += 1
-        for sub, _ in gl.named_parameters():
-            gn, sn = f"model.layers.{i}.{sub}", f"model.layers.{j}.{sub}"
-            if sn in name_moments:
-                grown_to_src[gn] = sn
-
-    # Inject the moments into the grown optimizer's state (before the first step).
-    grown_named = dict(grown_model.named_parameters())
     n = 0
-    for gn, sn in grown_to_src.items():
-        gp = grown_named.get(gn)
-        st = name_moments.get(sn)
-        if gp is None or st is None or st["exp_avg"].shape != gp.shape:
-            continue
-        step = st.get("step", 0)
-        step = step.clone() if torch.is_tensor(step) else torch.tensor(float(step))
-        optimizer.state[gp] = {
-            "step": step.to(gp.device),
-            "exp_avg": st["exp_avg"].to(gp.device).clone(),
-            "exp_avg_sq": st["exp_avg_sq"].to(gp.device).clone(),
-        }
-        n += 1
-    print(f"[momentum transfer] injected Adam moments for {n} params across {n_layers} "
-          f"matched (kept) layers; interpolated layers left fresh.  source={source_ckpt}")
+    for shared in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
+        st = M.get(shared)
+        if st:
+            n += set_state(shared, st["exp_avg"], st["exp_avg_sq"], st["step"])
+
+    layers = grown_model.model.layers
+    matched = [match(gl) for gl in layers]
+    n_kept = n_ins = 0
+    i = 0
+    while i < len(layers):
+        if matched[i] is not None:                    # kept / copy-last: copy source moments
+            l = matched[i]
+            for sub, _ in layers[i].named_parameters():
+                st = M.get(f"model.layers.{l}.{plain(sub)}")
+                if st:
+                    n += set_state(f"model.layers.{i}.{sub}", st["exp_avg"], st["exp_avg_sq"], st["step"])
+            n_kept += 1
+            i += 1
+        else:                                         # a run of inserted layers between two kept
+            j = i
+            while j < len(layers) and matched[j] is None:
+                j += 1
+            la = matched[i - 1] if i > 0 else None     # left/right kept source indices
+            lb = matched[j] if j < len(layers) else None  # (run may reach the model's end)
+            c = j - i                                  # inserts in this gap
+            if warm_inserted and la is not None and lb is not None:
+                for k in range(c):
+                    gi, t = i + k, (k + 1) / (c + 1)   # same t as the weight interpolation
+                    for sub, _ in layers[gi].named_parameters():
+                        ps = plain(sub)
+                        sl = M.get(f"model.layers.{la}.{ps}")
+                        sr = M.get(f"model.layers.{lb}.{ps}")
+                        if sl is None or sr is None:
+                            continue
+                        v = torch.exp((1 - t) * torch.log(sl["exp_avg_sq"].clamp_min(1e-30))
+                                      + t * torch.log(sr["exp_avg_sq"].clamp_min(1e-30)))
+                        m = (1 - t) * sl["exp_avg"] + t * sr["exp_avg"]
+                        n += set_state(f"model.layers.{gi}.{sub}", m, v, sl["step"])
+                    n_ins += 1
+            i = j
+
+    print(f"[momentum transfer] set {n} params | kept layers={n_kept} | "
+          f"warmed inserted layers={n_ins} (warm_inserted={warm_inserted})")
     del src, src_opt
