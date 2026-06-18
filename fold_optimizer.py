@@ -19,18 +19,23 @@ It writes `<folded_dir>/optimizer.pt` over the FOLDED model's [decay, no-decay] 
 so the existing `train.py --init-optimizer-from <folded_dir>` (momentum_transfer.transfer_moments)
 picks it up by name and warm-starts the continued run.
 
+Inputs / output:
+    --source : INPUT  the gated checkpoint (has optimizer.pt + the gate values to rescale by)
+    --folded : INPUT  the folded model dir from fold_model.py (read for its param structure)
+               OUTPUT  optimizer.pt is WRITTEN into this same dir, ready for --init-optimizer-from
+
 Usage:
-    python fold_model.py     <gated_ckpt> <folded_dir>     # 1) fold the weights
-    python fold_optimizer.py <gated_ckpt> <folded_dir>     # 2) fold the moments
+    python fold_model.py     --source <gated_ckpt> --out    <folded_dir>   # 1) fold the weights
+    python fold_optimizer.py --source <gated_ckpt> --folded <folded_dir>   # 2) fold the moments
     python train.py --model <folded_dir> --prior-steps <global_step> ... \
-                    --init-optimizer-from <folded_dir>      # 3) continue, moments warm
+                    --init-optimizer-from <folded_dir>                      # 3) continue, moments warm
 
 Assumes the gated run used --gate-lr-mult 1.0 (gates share the no-decay group) OR >1.0
 (gates in a separate 3rd group); both are detected from optimizer.pt automatically.
 """
+import argparse
 import os
 import re
-import sys
 
 import torch
 from transformers import AutoModelForCausalLM, Qwen2ForCausalLM
@@ -138,6 +143,11 @@ def fold_optimizer(gated_ckpt, folded_dir):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: python fold_optimizer.py <gated_ckpt> <folded_dir>")
-    fold_optimizer(sys.argv[1], sys.argv[2])
+    ap = argparse.ArgumentParser(
+        description="Fold a gated checkpoint's Adam moments to match the folded plain model.")
+    ap.add_argument("--source", required=True,
+                    help="INPUT: gated checkpoint (its optimizer.pt + gate values)")
+    ap.add_argument("--folded", required=True,
+                    help="INPUT+OUTPUT: folded model dir from fold_model.py; optimizer.pt is written here")
+    args = ap.parse_args()
+    fold_optimizer(args.source, args.folded)

@@ -21,19 +21,19 @@ the inserted layers in smoothly, then fold and continue training the plain model
 the fold, run fold_optimizer.py on the same checkpoint afterwards.
 
 Usage:
-    python fold_model.py <gated_ckpt_dir> <out_dir>
+    # --source : INPUT  gated checkpoint dir   --out : OUTPUT folded plain-Qwen2 dir
+    python fold_model.py --source <gated_ckpt_dir> --out <folded_dir>
 
     # then (optional) carry the optimizer moments, and continue training:
-    python fold_optimizer.py <gated_ckpt_dir> <out_dir>
-    python train.py --model <out_dir> --prior-steps <global_step> ... \
-                    --init-optimizer-from <out_dir>
+    python fold_optimizer.py --source <gated_ckpt_dir> --folded <folded_dir>
+    python train.py --model <folded_dir> --prior-steps <global_step> ... \
+                    --init-optimizer-from <folded_dir>
 
-Note: <gated_ckpt_dir> must be loadable with trust_remote_code (it needs
-modeling_gated_qwen2.py). If a training checkpoint lacks that file, copy it in from the
-grown-model dir first.
+Note: --source must be loadable with trust_remote_code (it needs modeling_gated_qwen2.py).
+If a training checkpoint lacks that file, copy it in from the grown-model dir first.
 """
+import argparse
 import os
-import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
@@ -67,6 +67,11 @@ def fold_model(gated_ckpt, out_dir):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: python fold_model.py <gated_ckpt_dir> <out_dir>")
-    fold_model(sys.argv[1], sys.argv[2])
+    ap = argparse.ArgumentParser(
+        description="Fold the alpha/beta gates of a gated checkpoint into a plain Qwen2.")
+    ap.add_argument("--source", required=True,
+                    help="INPUT: gated checkpoint dir (loaded with trust_remote_code)")
+    ap.add_argument("--out", required=True,
+                    help="OUTPUT: dir to write the folded plain Qwen2 model")
+    args = ap.parse_args()
+    fold_model(args.source, args.out)
