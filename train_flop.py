@@ -38,8 +38,14 @@ from transformers import (
 
 
 def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps,
-                   min_lr_ratio=0.0, flops_scale=1.0):
+                   min_lr_ratio=0.0, flops_scale=1.0, const_lr=False, decay_frac=0.0):
     """One warmup+cosine schedule indexed by COMPUTE (not raw steps).
+
+    If const_lr=True: warmup -> CONSTANT peak LR (optionally a WSD linear decay
+    over the last `decay_frac` of total_steps). This drops all compute/cosine
+    dependence -- every phase sits at the same LR everywhere, so flops_scale and
+    the prior-steps cosine position are irrelevant (prior_steps then only offsets
+    the log + data skip). Much simpler to compare growth vs baseline.
 
     `total_steps`, `warmup_steps`, `prior_steps` are all measured in
     LARGE-MODEL-EQUIVALENT steps (= cumulative FLOPs / (6 * N_ref * tok/step)),
@@ -67,16 +73,31 @@ def make_lr_lambda(total_steps, warmup_steps, prior_steps, rewarmup_steps,
         # cosine from 1.0 down to min_lr_ratio (the floor), not to 0
         return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * prog))
 
+    def const_factor(g):
+        # Warmup -> CONSTANT peak LR. No compute dependence, so baseline and grown
+        # runs sit at the same LR at every FLOPs (no flops_scale needed). Optional
+        # WSD tail: linear 1.0 -> min_lr_ratio over the LAST decay_frac of total_steps.
+        if g < warmup_steps:
+            return g / max(1, warmup_steps)
+        if decay_frac > 0.0 and total_steps > 0:
+            decay_start = total_steps * (1.0 - decay_frac)
+            if g > decay_start:
+                p = min(1.0, max(0.0, (g - decay_start) / max(1, total_steps - decay_start)))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - p)
+        return 1.0
+
+    factor = const_factor if const_lr else cos_factor
+    scale = 1.0 if const_lr else flops_scale   # const LR needs no FLOPs alignment
+
     def lr_lambda(local_step):
         if rewarmup_steps > 0 and local_step < rewarmup_steps:
-            # UNCOUNTED warm-up preamble: ramp 0 -> the LR AT the resume compute
-            # point (prior_steps). These steps do not advance the cosine, so when
-            # warm-up ends the LR equals the global cosine value at prior_steps.
-            return (local_step / rewarmup_steps) * cos_factor(prior_steps)
-        # Advance the cosine by flops_scale per local step: cumulative compute,
-        # in large-equiv steps, is prior_steps + flops_scale * (local - rewarmup).
+            # UNCOUNTED warm-up preamble: ramp 0 -> the LR AT the resume point
+            # (prior_steps). For const LR that target is the peak (1.0).
+            return (local_step / rewarmup_steps) * factor(prior_steps)
+        # cosine: advance by flops_scale per local step (compute-indexed).
+        # const : scale=1, position only decides warmup / WSD-tail membership.
         eff = local_step - rewarmup_steps
-        return cos_factor(prior_steps + flops_scale * eff)
+        return factor(prior_steps + scale * eff)
 
     return lr_lambda
 
@@ -85,10 +106,11 @@ class GrowTrainer(Trainer):
     """Trainer that installs the unified warmup+cosine schedule above."""
 
     def set_schedule(self, total_steps, warmup_steps, prior_steps, rewarmup_steps,
-                     min_lr_ratio=0.0, flops_scale=1.0):
+                     min_lr_ratio=0.0, flops_scale=1.0, const_lr=False, decay_frac=0.0):
         self._sched = dict(total_steps=total_steps, warmup_steps=warmup_steps,
                            prior_steps=prior_steps, rewarmup_steps=rewarmup_steps,
-                           min_lr_ratio=min_lr_ratio, flops_scale=flops_scale)
+                           min_lr_ratio=min_lr_ratio, flops_scale=flops_scale,
+                           const_lr=const_lr, decay_frac=decay_frac)
 
     def get_decay_parameter_names(self, model):
         # Keep weight decay OFF for the zero-init residual gates (alpha/beta):
@@ -116,7 +138,8 @@ class GrowTrainer(Trainer):
             self.lr_scheduler = LambdaLR(
                 opt,
                 make_lr_lambda(total, s["warmup_steps"], s["prior_steps"], s["rewarmup_steps"],
-                               s["min_lr_ratio"], s["flops_scale"]),
+                               s["min_lr_ratio"], s["flops_scale"],
+                               s["const_lr"], s["decay_frac"]),
             )
         return self.lr_scheduler
 
@@ -273,6 +296,14 @@ def main():
     p.add_argument("--min-lr-ratio", type=float, default=0.0,
                    help="cosine floors at this fraction of peak LR instead of decaying to 0 "
                         "(e.g. 0.1 = G_stack's min-LR = 10%% of max-LR). 0.0 = decay to 0.")
+    p.add_argument("--const-lr", action="store_true",
+                   help="use a CONSTANT LR after warmup (no cosine). Removes all FLOPs/cosine "
+                        "alignment: every phase sits at the same LR everywhere, so --ref-params / "
+                        "prior-steps no longer affect the LR (they only offset log + data skip).")
+    p.add_argument("--decay-frac", type=float, default=0.0,
+                   help="with --const-lr: WSD-style linear decay (1.0 -> min-lr-ratio) over the "
+                        "LAST this-fraction of --total-steps. 0 = pure constant. Use >0 only on the "
+                        "FINAL run (not phase-1) if you want an end anneal.")
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help="override epochs; -1 disables")
     p.add_argument("--save-steps", type=int, default=1000)
@@ -372,7 +403,19 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     print(f"Loading tokenized dataset: {args.data}")
-    ds = load_from_disk(args.data)
+    # --data may be a COMMA-SEPARATED list of packed dirs; concatenate them at LOAD
+    # time (memory-mapped, no new copy on disk). Order is fixed by the string, so
+    # len(ds) + the seeded permutation stay identical across runs -> skip-samples
+    # continuation remains valid. Pass the SAME order everywhere.
+    _paths = [p for p in args.data.split(",") if p]
+    _parts = [load_from_disk(p) for p in _paths]
+    if len(_parts) == 1:
+        ds = _parts[0]
+    else:
+        from datasets import concatenate_datasets
+        ds = concatenate_datasets(_parts)
+        print(f"Concatenated {len(_parts)} datasets at load (no disk copy): "
+              f"{[len(x) for x in _parts]} -> {len(ds)} blocks")
     # phase-2 continuation (prior_steps>0): line the grown run up with the baseline
     # sample-for-sample. Phase-1 read epoch-0 in the seeded permutation order
     # randperm(n, seed); we rebuild that permutation and feed the slice IN ORDER
@@ -424,7 +467,9 @@ def main():
     stop_at = args.stop_at_step
     if args.growth_ratio is not None:
         stop_at = round(args.growth_ratio * total_steps)
-    print(f"Schedule: total_steps(global)={total_steps} warmup={warmup_steps} "
+    sched_kind = (f"CONST-LR (decay_frac={args.decay_frac})" if args.const_lr
+                  else f"cosine (min_lr_ratio={args.min_lr_ratio})")
+    print(f"Schedule: {sched_kind} | total_steps(global)={total_steps} warmup={warmup_steps} "
           f"prior_steps={args.prior_steps} rewarmup={args.rewarmup_steps} stop_at={stop_at}")
 
     # For a grown phase, the optimizer-step budget is the UNCOUNTED warm-up preamble
@@ -475,6 +520,7 @@ def main():
         prior_steps=args.prior_steps, prior_tokens=args.prior_tokens,
         prior_flops=args.prior_flops,
         ref_params=int(ref_params), flops_scale=flops_scale,
+        min_lr_ratio=args.min_lr_ratio, const_lr=args.const_lr, decay_frac=args.decay_frac,
     )
     with open(os.path.join(args.out, "run_config.json"), "w") as f:
         json.dump(run_cfg, f, indent=2)
@@ -494,7 +540,8 @@ def main():
         callbacks=callbacks,
     )
     trainer.set_schedule(total_steps, warmup_steps, args.prior_steps, args.rewarmup_steps,
-                         min_lr_ratio=args.min_lr_ratio, flops_scale=flops_scale)
+                         min_lr_ratio=args.min_lr_ratio, flops_scale=flops_scale,
+                         const_lr=args.const_lr, decay_frac=args.decay_frac)
     trainer._sequential_data = sequential_data  # feed the permuted slice in order (phase-2)
     trainer._init_opt_from = args.init_optimizer_from  # optional Adam-moment warm-start
     trainer._warm_inserted = args.warm_inserted        # also warm inserted layers' moments
