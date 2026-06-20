@@ -219,6 +219,34 @@ class StopAtStep(TrainerCallback):
         return control
 
 
+class ForceGateOpen(TrainerCallback):
+    """FORCE every alpha/beta gate to a scheduled value, overriding what the
+    optimizer learns. Ramps gate = target * min(1, step/ramp_steps), then holds.
+
+    Why: learned zero-init gates open slowly/partially, so the grown model pays
+    full deep-model FLOPs while the inserted layers stay near-dormant. Forcing the
+    gates open guarantees the inserted layers fade IN on a fixed schedule (and
+    gate>0 also un-freezes the inserted-layer weights, since their grad scales with
+    the gate). Grow WITH gates (smooth, function-preserving at grow) and let this
+    ramp them open -- a middle ground between learned gates and --no-gate.
+    """
+
+    def __init__(self, model, target=1.0, ramp_steps=2000):
+        # capture the gate parameters once; their tensors persist across steps
+        self.gates = [m for n, m in model.named_parameters() if n.endswith(".gate")]
+        self.target = float(target)
+        self.ramp = max(1, ramp_steps)
+        print(f"[force-gate] {len(self.gates)} gates -> ramp 0..{self.target} over {self.ramp} steps")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        # after the optimizer step: overwrite gate values with the schedule.
+        v = self.target * min(1.0, state.global_step / self.ramp)
+        with torch.no_grad():
+            for g in self.gates:
+                g.fill_(v)
+        return control
+
+
 class MetricLogger(TrainerCallback):
     """Append training metrics to a tab-separated file for later plotting.
 
@@ -357,6 +385,12 @@ def main():
     p.add_argument("--gate-lr-mult", type=float, default=1.0,
                    help="LR multiplier for the alpha/beta gate params (separate optimizer group). "
                         "1.0 = identical to the original single-LR setup; >1 opens gates faster.")
+    p.add_argument("--gate-force-steps", type=int, default=0,
+                   help="FORCE gates open: ramp every alpha/beta = target*min(1, step/this) and hold "
+                        "(overrides the learned value). 0 = off (gates learned normally). Use to "
+                        "guarantee inserted layers fade in instead of staying dormant.")
+    p.add_argument("--gate-force-target", type=float, default=1.0,
+                   help="with --gate-force-steps: the value gates ramp up to (default 1.0 = fully open).")
     p.add_argument("--skip-samples", type=int, default=0,
                    help="phase-2: number of samples the prior phase consumed (overrides the "
                         "auto value prior_steps*batch_size*grad_accum). Normally leave 0 and just "
@@ -530,6 +564,8 @@ def main():
                               rewarmup_steps=args.rewarmup_steps)]
     if stop_at and stop_at > 0:
         callbacks.append(StopAtStep(stop_at))
+    if args.gate_force_steps > 0:
+        callbacks.append(ForceGateOpen(model, args.gate_force_target, args.gate_force_steps))
 
     trainer = GrowTrainer(
         model=model,
