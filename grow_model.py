@@ -143,13 +143,13 @@ def grow(source_path, total_insert, per_gap, gated=True, uv_align=False):
     n_interp = min(total_insert, capacity)
     n_copy = total_insert - n_interp
 
-    # Distribute the interpolated inserts into gaps, from the back; <= per_gap per gap.
-    fill, remaining, l = {}, n_interp, L - 2
-    while remaining > 0 and l >= 0:
-        c = min(per_gap, remaining)
-        fill[l] = c
-        remaining -= c
-        l -= 1
+    # Distribute the interpolated inserts EVENLY across the (L-1) gaps; the remainder
+    # goes to the BACK gaps (deeper gaps get one extra). Stays <= per_gap because
+    # n_interp <= capacity = (L-1)*per_gap. E.g. 12 over 5 gaps -> [2,2,2,3,3].
+    n_gaps = L - 1
+    base, rem = divmod(n_interp, n_gaps)
+    fill = {l: base + (1 if l >= n_gaps - rem else 0) for l in range(n_gaps)}
+    fill = {l: c for l, c in fill.items() if c > 0}   # drop empty gaps
 
     # A gap with c inserts is subdivided into c+1 equal steps: t_j = j/(c+1), j=1..c.
     plan = []  # 'orig' -> source idx ; 'interp' -> (l, t) ; 'copy' -> source idx
