@@ -310,11 +310,15 @@ def stack_grow(source_path, total_insert):
 
 
 @torch.no_grad()
-def extrap_grow(source_path, total_insert, theta_max=0.6, gated=True):
+def extrap_grow(source_path, total_insert, theta_max=0.6, gated=True, copy_last=False):
     """Extrapolation growth: keep the L source layers, then APPEND `total_insert` new layers
     at the end, each continuing the (layer L-2 -> layer L-1) SVD trajectory at t=1+j
     (geodesic U,V rotation + erank-frozen spectrum + capped scale extrapolation). The
-    appended layers get zero-init alpha/beta gates (function-preserving) unless gated=False."""
+    appended layers get zero-init alpha/beta gates (function-preserving) unless gated=False.
+
+    copy_last=True is the ablation baseline: append `total_insert` EXACT copies of the last
+    layer instead of extrapolating (same append-at-end structure + gates, zero trajectory),
+    so extrap-vs-copy_last isolates the value of the trajectory continuation."""
     src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
     src.eval()
     L = src.config.num_hidden_layers
@@ -355,13 +359,17 @@ def extrap_grow(source_path, total_insert, theta_max=0.6, gated=True):
     sd_r = src_layers[L - 1].state_dict()       # last
     for i in range(L):                          # original layers: exact copy
         _load_layer(new.model.layers[i], src_layers[i].state_dict())
-    for j in range(1, total_insert + 1):        # appended layers: extrapolate at t = 1+j
-        sd = extrap_layer_state(sd_l, sd_r, t=1.0 + j, theta_max=theta_max)
+    for j in range(1, total_insert + 1):        # appended layers
+        if copy_last:
+            sd = {k: v.clone() for k, v in sd_r.items()}          # exact copy of the last layer
+        else:
+            sd = extrap_layer_state(sd_l, sd_r, t=1.0 + j, theta_max=theta_max)
         _load_layer(new.model.layers[L - 1 + j], sd)
 
     tag = "gated zero-init" if gated else "DIRECT, no gate"
-    print(f"Extrap: L={L} -> {target_L} | appended {total_insert} layers by geodesic+scale "
-          f"extrapolation of layers {L-2}->{L-1} (t=2..{total_insert+1}), theta_max={theta_max}")
+    mode = "copy-last (exact copies)" if copy_last else \
+        f"geodesic+scale extrapolation of layers {L-2}->{L-1} (t=2..{total_insert+1}), theta_max={theta_max}"
+    print(f"Extrap: L={L} -> {target_L} | appended {total_insert} layers by {mode}")
     print(f"  appended ({tag}) layers: {added}")
     return src, new, None
 
@@ -460,6 +468,11 @@ def main():
     p.add_argument("--theta-max", type=float, default=0.6,
                    help="cap (radians) on each singular direction's cumulative rotation during "
                         "--extrap; smaller = more conservative. Only used with --extrap.")
+    p.add_argument("--copy-last", action="store_true",
+                   help="ablation baseline for --extrap: APPEND total_insert exact copies of the "
+                        "last layer (same append-at-end structure, no trajectory). Defaults to "
+                        "PLAIN / no gate (copies are real trained layers, active from step 0). "
+                        "Run vs --extrap to isolate the value of the geodesic+scale continuation.")
     args = p.parse_args()
 
     if args.fold:
@@ -470,9 +483,12 @@ def main():
     if args.gstack:
         gated = False
         src, new, plan = stack_grow(args.source, args.total_insert)
-    elif args.extrap:
+    elif args.extrap or args.copy_last:
+        if args.copy_last:
+            gated = False            # copy-last baseline defaults to plain (no gate)
         src, new, plan = extrap_grow(args.source, args.total_insert,
-                                     theta_max=args.theta_max, gated=gated)
+                                     theta_max=args.theta_max, gated=gated,
+                                     copy_last=args.copy_last)
     else:
         src, new, plan = grow(args.source, args.total_insert, args.per_gap,
                               gated=gated, uv_align=args.uv_align)
