@@ -124,6 +124,61 @@ def interp_layer_state(sd_l, sd_r, t, uv_align=False):
 
 
 # ---------------------------------------------------------------------------
+# Extrapolation: continue the depth trajectory PAST the last layer (t > 1)
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def geodesic_extrap(A, B, t, theta_max=0.6):
+    """Same shortest-arc Stiefel geodesic as `geodesic`, but continued to t > 1:
+    t=1 -> col(B); t>1 -> rotate BEYOND B (extrapolation). Each principal direction's
+    cumulative rotation is capped at theta_max so an 18-step extrapolation cannot
+    overshoot/wrap around."""
+    A, B = A.double(), B.double()
+    X, c, Yt = torch.linalg.svd(A.T @ B)
+    th = torch.arccos(torch.clamp(c, 0.0, 1.0))
+    ang = torch.clamp(t * th, max=theta_max)
+    A_aligned = A @ X
+    sin_th = torch.sin(th)
+    safe = torch.where(sin_th > 1e-7, sin_th, torch.full_like(sin_th, float("inf")))
+    Q = (B @ Yt.T - A_aligned * c) / safe
+    G = A_aligned * torch.cos(ang) + Q * torch.sin(ang)
+    return torch.linalg.qr(G)[0][:, : A.shape[1]]
+
+
+@torch.no_grad()
+def extrap_matrix(Wl, Wr, t, theta_max=0.6, energy_step_cap=0.03):
+    """Extrapolate the Wl->Wr SVD trajectory to t>1 (erank-frozen variant):
+      * U, V  : geodesic_extrap -- the rotation continues past the last layer;
+      * SHAPE : frozen at Wr's normalized spectrum, so erank stays on its depth plateau
+                (the conserved quantity seen in the erank-vs-depth plots);
+      * SCALE : only the total energy is extrapolated, with the per-step log-change capped
+                at energy_step_cap so 18 steps cannot blow up / vanish.
+    1-D tensors are handled in extrap_layer_state."""
+    Ul, sl, Vlh = torch.linalg.svd(Wl.double(), full_matrices=False)
+    Ur, sr, Vrh = torch.linalg.svd(Wr.double(), full_matrices=False)
+    U = geodesic_extrap(Ul, Ur, t, theta_max)
+    V = geodesic_extrap(Vlh.T, Vrh.T, t, theta_max)
+    shape = sr / sr.sum()                                            # erank frozen at Wr
+    el, er = torch.log(sl.sum()), torch.log(sr.sum())
+    step = torch.clamp(er - el, -energy_step_cap, energy_step_cap)   # capped energy drift
+    s = shape * torch.exp(er + (t - 1.0) * step)                     # gentle scale extrap
+    return ((U * s) @ V.T).to(Wl.dtype)
+
+
+@torch.no_grad()
+def extrap_layer_state(sd_l, sd_r, t, theta_max=0.6):
+    """Build an APPENDED layer's state_dict by extrapolating the (sd_l -> sd_r) trajectory.
+      * 2-D weights -> SVD geodesic + scale extrapolation (extrap_matrix);
+      * 1-D tensors (q/k/v biases, RMSNorm scales) -> FROZEN at the last layer for now.
+        (The appended layers are gated to identity at init, so these don't affect the step-0
+        function; training adjusts them once the gates open.)"""
+    out = {}
+    for k, vr in sd_r.items():
+        vl = sd_l[k]
+        out[k] = extrap_matrix(vl, vr, t, theta_max=theta_max) if vr.ndim == 2 else vr.clone()
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Build the grown model
 # ---------------------------------------------------------------------------
 @torch.no_grad()
@@ -254,6 +309,63 @@ def stack_grow(source_path, total_insert):
     return src, new, None
 
 
+@torch.no_grad()
+def extrap_grow(source_path, total_insert, theta_max=0.6, gated=True):
+    """Extrapolation growth: keep the L source layers, then APPEND `total_insert` new layers
+    at the end, each continuing the (layer L-2 -> layer L-1) SVD trajectory at t=1+j
+    (geodesic U,V rotation + erank-frozen spectrum + capped scale extrapolation). The
+    appended layers get zero-init alpha/beta gates (function-preserving) unless gated=False."""
+    src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
+    src.eval()
+    L = src.config.num_hidden_layers
+    if L < 2:
+        raise SystemExit("extrap needs >= 2 source layers to estimate the depth trajectory")
+    target_L = L + total_insert
+    added = list(range(L, target_L))
+
+    cfg_dict = src.config.to_dict()
+    for k in ("model_type", "architectures", "auto_map",
+              "transformers_version", "_name_or_path", "layer_types"):
+        cfg_dict.pop(k, None)
+    cfg_dict["num_hidden_layers"] = target_L
+    if gated:
+        cfg = GatedQwen2Config(**cfg_dict)
+        cfg.gated_layers = added
+        cfg.architectures = ["GatedQwen2ForCausalLM"]
+        cfg.auto_map = {
+            "AutoConfig": "modeling_gated_qwen2.GatedQwen2Config",
+            "AutoModelForCausalLM": "modeling_gated_qwen2.GatedQwen2ForCausalLM",
+        }
+        new = GatedQwen2ForCausalLM(cfg)
+    else:
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+        cfg = Qwen2Config(**cfg_dict)
+        cfg.architectures = ["Qwen2ForCausalLM"]
+        new = Qwen2ForCausalLM(cfg)
+    new.eval()
+
+    new.model.embed_tokens.load_state_dict(src.model.embed_tokens.state_dict())
+    new.model.norm.load_state_dict(src.model.norm.state_dict())
+    if not cfg.tie_word_embeddings:
+        new.lm_head.load_state_dict(src.lm_head.state_dict())
+    new.tie_weights()
+
+    src_layers = src.model.layers
+    sd_l = src_layers[L - 2].state_dict()       # second-to-last (trajectory direction)
+    sd_r = src_layers[L - 1].state_dict()       # last
+    for i in range(L):                          # original layers: exact copy
+        _load_layer(new.model.layers[i], src_layers[i].state_dict())
+    for j in range(1, total_insert + 1):        # appended layers: extrapolate at t = 1+j
+        sd = extrap_layer_state(sd_l, sd_r, t=1.0 + j, theta_max=theta_max)
+        _load_layer(new.model.layers[L - 1 + j], sd)
+
+    tag = "gated zero-init" if gated else "DIRECT, no gate"
+    print(f"Extrap: L={L} -> {target_L} | appended {total_insert} layers by geodesic+scale "
+          f"extrapolation of layers {L-2}->{L-1} (t=2..{total_insert+1}), theta_max={theta_max}")
+    print(f"  appended ({tag}) layers: {added}")
+    return src, new, None
+
+
 def _load_layer(dst_layer, plain_sd):
     """Load a *plain* (ungated) layer state_dict into dst, which may have
     GatedLinear-wrapped o_proj/down_proj. Remaps `<x>.weight` -> `<x>.base.weight`
@@ -339,6 +451,15 @@ def main():
     p.add_argument("--gstack", action="store_true",
                    help="G_stack baseline: plain depthwise stacking (copy-paste, layer i <- i mod L), "
                         "no interpolation/gates. For a fair comparison against the interpolation method.")
+    p.add_argument("--extrap", action="store_true",
+                   help="extrapolation growth: APPEND total_insert new layers at the end, each "
+                        "continuing the last-gap (L-2 -> L-1) SVD trajectory -- geodesic U,V rotation "
+                        "+ erank-frozen spectrum + capped scale extrapolation -- instead of "
+                        "copying (gstack) or interpolating. Gated (function-preserving) by default; "
+                        "add --no-gate for direct.")
+    p.add_argument("--theta-max", type=float, default=0.6,
+                   help="cap (radians) on each singular direction's cumulative rotation during "
+                        "--extrap; smaller = more conservative. Only used with --extrap.")
     args = p.parse_args()
 
     if args.fold:
@@ -349,6 +470,9 @@ def main():
     if args.gstack:
         gated = False
         src, new, plan = stack_grow(args.source, args.total_insert)
+    elif args.extrap:
+        src, new, plan = extrap_grow(args.source, args.total_insert,
+                                     theta_max=args.theta_max, gated=gated)
     else:
         src, new, plan = grow(args.source, args.total_insert, args.per_gap,
                               gated=gated, uv_align=args.uv_align)
