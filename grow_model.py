@@ -101,13 +101,38 @@ def _interp_paired(Wl, Wr, t):
     return ((U * s) @ V.T).to(Wl.dtype)
 
 
-def interp_matrix(Wl, Wr, t, uv_align=False):
-    """Default = original geodesic; uv_align=True = U,V-consistent paired slerp."""
+def _interp_hungarian(Wl, Wr, t):
+    """OPT-IN (--ot-match): like _interp_paired, but PAIR the singular triplets by actual
+    direction overlap (Hungarian assignment on |Ul^T Ur| + |Vl^T Vr|) instead of by
+    singular-value ORDER, so the slerp / geometric-mean combine CORRESPONDING singular
+    directions even when the two layers' directions are permuted. Fixes the incoherent
+    interpolated layers (mismatched directions) that destabilize training."""
+    from scipy.optimize import linear_sum_assignment
+    Ul, sl, Vlh = torch.linalg.svd(Wl.double(), full_matrices=False)
+    Ur, sr, Vrh = torch.linalg.svd(Wr.double(), full_matrices=False)
+    Vl, Vr = Vlh.T, Vrh.T
+    affinity = (Ul.T @ Ur).abs() + (Vl.T @ Vr).abs()              # [r, r] left+right overlap
+    _, col = linear_sum_assignment((-affinity).cpu().numpy())     # maximize overlap
+    perm = torch.as_tensor(col, device=Ur.device)
+    Ur, sr, Vr = Ur[:, perm], sr[perm], Vr[:, perm]               # reorder Wr triplets to match Wl
+    sign = torch.sign((Ul * Ur).sum(0)); sign[sign == 0] = 1.0
+    Ur, Vr = Ur * sign, Vr * sign                                 # joint sign align (u & v together)
+    U = slerp_cols(Ul, Ur, t)
+    V = slerp_cols(Vl, Vr, t)
+    s = torch.exp((1.0 - t) * torch.log(sl) + t * torch.log(sr))
+    return ((U * s) @ V.T).to(Wl.dtype)
+
+
+def interp_matrix(Wl, Wr, t, uv_align=False, ot_match=False):
+    """Default = original geodesic; uv_align=True = U,V-consistent paired slerp;
+    ot_match=True = paired slerp with Hungarian direction-matching (overrides uv_align)."""
+    if ot_match:
+        return _interp_hungarian(Wl, Wr, t)
     return _interp_paired(Wl, Wr, t) if uv_align else _interp_geodesic(Wl, Wr, t)
 
 
 @torch.no_grad()
-def interp_layer_state(sd_l, sd_r, t, uv_align=False):
+def interp_layer_state(sd_l, sd_r, t, uv_align=False, ot_match=False):
     """Build an inserted layer's state_dict from two neighbour state_dicts.
 
     2-D tensors (the 7 weight matrices) -> SVD interpolation.
@@ -117,7 +142,7 @@ def interp_layer_state(sd_l, sd_r, t, uv_align=False):
     for k, vl in sd_l.items():
         vr = sd_r[k]
         if vl.ndim == 2:
-            out[k] = interp_matrix(vl, vr, t, uv_align=uv_align)
+            out[k] = interp_matrix(vl, vr, t, uv_align=uv_align, ot_match=ot_match)
         else:
             out[k] = (1.0 - t) * vl + t * vr
     return out
@@ -182,7 +207,7 @@ def extrap_layer_state(sd_l, sd_r, t, theta_max=0.6):
 # Build the grown model
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def grow(source_path, total_insert, per_gap, gated=True, uv_align=False):
+def grow(source_path, total_insert, per_gap, gated=True, uv_align=False, ot_match=False):
     """Insert `total_insert` new layers, up to `per_gap` (>=2) per gap, filling gaps from
     the LAST gap (between layers L-2 and L-1) backward toward the front."""
     if per_gap < 1:
@@ -272,7 +297,8 @@ def grow(source_path, total_insert, per_gap, gated=True, uv_align=False):
         else:
             l, t = payload
             sd = interp_layer_state(src_layers[l].state_dict(),
-                                    src_layers[l + 1].state_dict(), t, uv_align=uv_align)
+                                    src_layers[l + 1].state_dict(), t,
+                                    uv_align=uv_align, ot_match=ot_match)
             _load_layer(dst, sd)
     return src, new, plan
 
@@ -456,6 +482,11 @@ def main():
     p.add_argument("--uv-align", action="store_true",
                    help="use the U,V-consistent paired-slerp interpolation (reconstructs endpoints) "
                         "instead of the default independent-geodesic interpolation. OFF by default.")
+    p.add_argument("--ot-match", action="store_true",
+                   help="paired-slerp interpolation but PAIR singular triplets by direction overlap "
+                        "(Hungarian on |Ul^T Ur|+|Vl^T Vr|) instead of by singular-value order, so the "
+                        "interpolated layers are coherent (fixes the gate-smax blow-up). Overrides "
+                        "--uv-align. Only used by the interpolation path.")
     p.add_argument("--gstack", action="store_true",
                    help="G_stack baseline: plain depthwise stacking (copy-paste, layer i <- i mod L), "
                         "no interpolation/gates. For a fair comparison against the interpolation method.")
@@ -491,7 +522,7 @@ def main():
                                      copy_last=args.copy_last)
     else:
         src, new, plan = grow(args.source, args.total_insert, args.per_gap,
-                              gated=gated, uv_align=args.uv_align)
+                              gated=gated, uv_align=args.uv_align, ot_match=args.ot_match)
     check_preservation(src, new, vocab=new.config.vocab_size, expect_zero=gated)
 
     os.makedirs(args.out, exist_ok=True)
