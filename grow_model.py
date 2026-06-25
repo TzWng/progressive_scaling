@@ -101,38 +101,13 @@ def _interp_paired(Wl, Wr, t):
     return ((U * s) @ V.T).to(Wl.dtype)
 
 
-def _interp_hungarian(Wl, Wr, t):
-    """OPT-IN (--ot-match): like _interp_paired, but PAIR the singular triplets by actual
-    direction overlap (Hungarian assignment on |Ul^T Ur| + |Vl^T Vr|) instead of by
-    singular-value ORDER, so the slerp / geometric-mean combine CORRESPONDING singular
-    directions even when the two layers' directions are permuted. Fixes the incoherent
-    interpolated layers (mismatched directions) that destabilize training."""
-    from scipy.optimize import linear_sum_assignment
-    Ul, sl, Vlh = torch.linalg.svd(Wl.double(), full_matrices=False)
-    Ur, sr, Vrh = torch.linalg.svd(Wr.double(), full_matrices=False)
-    Vl, Vr = Vlh.T, Vrh.T
-    affinity = (Ul.T @ Ur).abs() + (Vl.T @ Vr).abs()              # [r, r] left+right overlap
-    _, col = linear_sum_assignment((-affinity).cpu().numpy())     # maximize overlap
-    perm = torch.as_tensor(col, device=Ur.device)
-    Ur, sr, Vr = Ur[:, perm], sr[perm], Vr[:, perm]               # reorder Wr triplets to match Wl
-    sign = torch.sign((Ul * Ur).sum(0)); sign[sign == 0] = 1.0
-    Ur, Vr = Ur * sign, Vr * sign                                 # joint sign align (u & v together)
-    U = slerp_cols(Ul, Ur, t)
-    V = slerp_cols(Vl, Vr, t)
-    s = torch.exp((1.0 - t) * torch.log(sl) + t * torch.log(sr))
-    return ((U * s) @ V.T).to(Wl.dtype)
-
-
-def interp_matrix(Wl, Wr, t, uv_align=False, ot_match=False):
-    """Default = original geodesic; uv_align=True = U,V-consistent paired slerp;
-    ot_match=True = paired slerp with Hungarian direction-matching (overrides uv_align)."""
-    if ot_match:
-        return _interp_hungarian(Wl, Wr, t)
+def interp_matrix(Wl, Wr, t, uv_align=False):
+    """Default = original geodesic; uv_align=True = U,V-consistent paired slerp."""
     return _interp_paired(Wl, Wr, t) if uv_align else _interp_geodesic(Wl, Wr, t)
 
 
 @torch.no_grad()
-def interp_layer_state(sd_l, sd_r, t, uv_align=False, ot_match=False):
+def interp_layer_state(sd_l, sd_r, t, uv_align=False):
     """Build an inserted layer's state_dict from two neighbour state_dicts.
 
     2-D tensors (the 7 weight matrices) -> SVD interpolation.
@@ -142,64 +117,9 @@ def interp_layer_state(sd_l, sd_r, t, uv_align=False, ot_match=False):
     for k, vl in sd_l.items():
         vr = sd_r[k]
         if vl.ndim == 2:
-            out[k] = interp_matrix(vl, vr, t, uv_align=uv_align, ot_match=ot_match)
+            out[k] = interp_matrix(vl, vr, t, uv_align=uv_align)
         else:
             out[k] = (1.0 - t) * vl + t * vr
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Extrapolation: continue the depth trajectory PAST the last layer (t > 1)
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def geodesic_extrap(A, B, t, theta_max=0.6):
-    """Same shortest-arc Stiefel geodesic as `geodesic`, but continued to t > 1:
-    t=1 -> col(B); t>1 -> rotate BEYOND B (extrapolation). Each principal direction's
-    cumulative rotation is capped at theta_max so an 18-step extrapolation cannot
-    overshoot/wrap around."""
-    A, B = A.double(), B.double()
-    X, c, Yt = torch.linalg.svd(A.T @ B)
-    th = torch.arccos(torch.clamp(c, 0.0, 1.0))
-    ang = torch.clamp(t * th, max=theta_max)
-    A_aligned = A @ X
-    sin_th = torch.sin(th)
-    safe = torch.where(sin_th > 1e-7, sin_th, torch.full_like(sin_th, float("inf")))
-    Q = (B @ Yt.T - A_aligned * c) / safe
-    G = A_aligned * torch.cos(ang) + Q * torch.sin(ang)
-    return torch.linalg.qr(G)[0][:, : A.shape[1]]
-
-
-@torch.no_grad()
-def extrap_matrix(Wl, Wr, t, theta_max=0.6, energy_step_cap=0.03):
-    """Extrapolate the Wl->Wr SVD trajectory to t>1 (erank-frozen variant):
-      * U, V  : geodesic_extrap -- the rotation continues past the last layer;
-      * SHAPE : frozen at Wr's normalized spectrum, so erank stays on its depth plateau
-                (the conserved quantity seen in the erank-vs-depth plots);
-      * SCALE : only the total energy is extrapolated, with the per-step log-change capped
-                at energy_step_cap so 18 steps cannot blow up / vanish.
-    1-D tensors are handled in extrap_layer_state."""
-    Ul, sl, Vlh = torch.linalg.svd(Wl.double(), full_matrices=False)
-    Ur, sr, Vrh = torch.linalg.svd(Wr.double(), full_matrices=False)
-    U = geodesic_extrap(Ul, Ur, t, theta_max)
-    V = geodesic_extrap(Vlh.T, Vrh.T, t, theta_max)
-    shape = sr / sr.sum()                                            # erank frozen at Wr
-    el, er = torch.log(sl.sum()), torch.log(sr.sum())
-    step = torch.clamp(er - el, -energy_step_cap, energy_step_cap)   # capped energy drift
-    s = shape * torch.exp(er + (t - 1.0) * step)                     # gentle scale extrap
-    return ((U * s) @ V.T).to(Wl.dtype)
-
-
-@torch.no_grad()
-def extrap_layer_state(sd_l, sd_r, t, theta_max=0.6):
-    """Build an APPENDED layer's state_dict by extrapolating the (sd_l -> sd_r) trajectory.
-      * 2-D weights -> SVD geodesic + scale extrapolation (extrap_matrix);
-      * 1-D tensors (q/k/v biases, RMSNorm scales) -> FROZEN at the last layer for now.
-        (The appended layers are gated to identity at init, so these don't affect the step-0
-        function; training adjusts them once the gates open.)"""
-    out = {}
-    for k, vr in sd_r.items():
-        vl = sd_l[k]
-        out[k] = extrap_matrix(vl, vr, t, theta_max=theta_max) if vr.ndim == 2 else vr.clone()
     return out
 
 
@@ -207,7 +127,7 @@ def extrap_layer_state(sd_l, sd_r, t, theta_max=0.6):
 # Build the grown model
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def grow(source_path, total_insert, per_gap, gated=True, uv_align=False, ot_match=False):
+def grow(source_path, total_insert, per_gap, gated=True, uv_align=False):
     """Insert `total_insert` new layers, up to `per_gap` (>=2) per gap, filling gaps from
     the LAST gap (between layers L-2 and L-1) backward toward the front."""
     if per_gap < 1:
@@ -297,8 +217,7 @@ def grow(source_path, total_insert, per_gap, gated=True, uv_align=False, ot_matc
         else:
             l, t = payload
             sd = interp_layer_state(src_layers[l].state_dict(),
-                                    src_layers[l + 1].state_dict(), t,
-                                    uv_align=uv_align, ot_match=ot_match)
+                                    src_layers[l + 1].state_dict(), t, uv_align=uv_align)
             _load_layer(dst, sd)
     return src, new, plan
 
@@ -336,67 +255,83 @@ def stack_grow(source_path, total_insert):
 
 
 @torch.no_grad()
-def extrap_grow(source_path, total_insert, theta_max=0.6, gated=True, copy_last=False):
-    """Extrapolation growth: keep the L source layers, then APPEND `total_insert` new layers
-    at the end, each continuing the (layer L-2 -> layer L-1) SVD trajectory at t=1+j
-    (geodesic U,V rotation + erank-frozen spectrum + capped scale extrapolation). The
-    appended layers get zero-init alpha/beta gates (function-preserving) unless gated=False.
-
-    copy_last=True is the ablation baseline: append `total_insert` EXACT copies of the last
-    layer instead of extrapolating (same append-at-end structure + gates, zero trajectory),
-    so extrap-vs-copy_last isolates the value of the trajectory continuation."""
-    src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
-    src.eval()
+def gdrift_grow(source_path, total_insert, eps=0.1, theta_max=0.6):
+    """G_drift: G_stack skeleton (grown layer p <- base layer p mod L) PLUS a small spectral
+    depth-drift on the repeated tiles. From the base layers' OWN depth trajectory we estimate,
+    per weight matrix, the net rotation of the singular bases (U, V) and the net energy change
+    across the block; tile k (= p // L) rotates its U, V by eps*k along that trajectory and
+    scales its spectrum by exp(eps*k * energy_drift) -- erank-preserving (shape frozen).
+    So the tiles become block / block+drift / block+2*drift / ... , breaking G_stack's frozen
+    period-L structure while every layer stays a SMALL rotation of a REAL trained layer
+    (coherent). eps=0 reproduces G_stack exactly (lower bound). Plain Qwen2, no gates."""
+    import scipy.linalg
+    src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32).eval()
     L = src.config.num_hidden_layers
     if L < 2:
-        raise SystemExit("extrap needs >= 2 source layers to estimate the depth trajectory")
+        raise SystemExit("gdrift needs >= 2 source layers to estimate the depth trajectory")
     target_L = L + total_insert
-    added = list(range(L, target_L))
+    sds = [src.model.layers[l].state_dict() for l in range(L)]
+    keys2d = [k for k, v in sds[0].items() if v.ndim == 2]
 
+    # per 2-D weight key: per-base-layer SVD + NET rotation generators (U,V) + net log-energy drift
+    traj = {}
+    for k in keys2d:
+        Us, Ss, Vs = [], [], []
+        for l in range(L):
+            U, S, Vh = torch.linalg.svd(sds[l][k].double(), full_matrices=False)
+            Us.append(U); Ss.append(S); Vs.append(Vh.T)
+        def net_gen(F):
+            M = F[0].T @ F[-1]                               # r x r, frame_0 -> frame_{L-1}
+            u, _, vh = torch.linalg.svd(M)                   # polar -> closest orthogonal
+            return torch.tensor(scipy.linalg.logm((u @ vh).cpu().numpy()).real, dtype=torch.float64)
+        OU, OV = net_gen(Us), net_gen(Vs)
+        de = torch.log(Ss[-1].sum()) - torch.log(Ss[0].sum())
+        traj[k] = (Us, Ss, Vs, OU, OV, de)
+
+    def clamp_gen(Omega, tmax):
+        n = torch.linalg.matrix_norm(Omega, 2)
+        return Omega * (tmax / n) if n > tmax else Omega
+
+    qcache = {}
+    def rot(k, side, scale):                                 # cached exp(scale * net_gen), clamped
+        key = (k, side, float(scale))
+        if key not in qcache:
+            Omega = traj[k][3] if side == "U" else traj[k][4]
+            qcache[key] = torch.matrix_exp(clamp_gen(scale * Omega, theta_max))
+        return qcache[key]
+
+    # plain Qwen2 (every layer is a small rotation of a real layer -> coherent, no gates needed)
     cfg_dict = src.config.to_dict()
-    for k in ("model_type", "architectures", "auto_map",
-              "transformers_version", "_name_or_path", "layer_types"):
-        cfg_dict.pop(k, None)
+    for kk in ("model_type", "architectures", "auto_map",
+               "transformers_version", "_name_or_path", "layer_types"):
+        cfg_dict.pop(kk, None)
     cfg_dict["num_hidden_layers"] = target_L
-    if gated:
-        cfg = GatedQwen2Config(**cfg_dict)
-        cfg.gated_layers = added
-        cfg.architectures = ["GatedQwen2ForCausalLM"]
-        cfg.auto_map = {
-            "AutoConfig": "modeling_gated_qwen2.GatedQwen2Config",
-            "AutoModelForCausalLM": "modeling_gated_qwen2.GatedQwen2ForCausalLM",
-        }
-        new = GatedQwen2ForCausalLM(cfg)
-    else:
-        from transformers import Qwen2Config, Qwen2ForCausalLM
-        cfg = Qwen2Config(**cfg_dict)
-        cfg.architectures = ["Qwen2ForCausalLM"]
-        new = Qwen2ForCausalLM(cfg)
-    new.eval()
-
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    cfg = Qwen2Config(**cfg_dict); cfg.architectures = ["Qwen2ForCausalLM"]
+    new = Qwen2ForCausalLM(cfg); new.eval()
     new.model.embed_tokens.load_state_dict(src.model.embed_tokens.state_dict())
     new.model.norm.load_state_dict(src.model.norm.state_dict())
     if not cfg.tie_word_embeddings:
         new.lm_head.load_state_dict(src.lm_head.state_dict())
     new.tie_weights()
 
-    src_layers = src.model.layers
-    sd_l = src_layers[L - 2].state_dict()       # second-to-last (trajectory direction)
-    sd_r = src_layers[L - 1].state_dict()       # last
-    for i in range(L):                          # original layers: exact copy
-        _load_layer(new.model.layers[i], src_layers[i].state_dict())
-    for j in range(1, total_insert + 1):        # appended layers
-        if copy_last:
-            sd = {k: v.clone() for k, v in sd_r.items()}          # exact copy of the last layer
-        else:
-            sd = extrap_layer_state(sd_l, sd_r, t=1.0 + j, theta_max=theta_max)
-        _load_layer(new.model.layers[L - 1 + j], sd)
+    for p in range(target_L):
+        i, tile = p % L, p // L                             # base index, tile index
+        scale = eps * tile                                  # tile 0 = exact (= G_stack)
+        out = {}
+        for key, v in sds[i].items():
+            if v.ndim != 2 or scale == 0.0:
+                out[key] = v.clone()                        # 1-D, or tile 0: exact base layer i
+            else:
+                Us, Ss, Vs, OU, OV, de = traj[key]
+                U = Us[i] @ rot(key, "U", scale)
+                V = Vs[i] @ rot(key, "V", scale)
+                s = Ss[i] * torch.exp(scale * de)           # scale only -> erank preserved
+                out[key] = ((U * s) @ V.T).to(v.dtype)
+        new.model.layers[p].load_state_dict(out, strict=True)
 
-    tag = "gated zero-init" if gated else "DIRECT, no gate"
-    mode = "copy-last (exact copies)" if copy_last else \
-        f"geodesic+scale extrapolation of layers {L-2}->{L-1} (t=2..{total_insert+1}), theta_max={theta_max}"
-    print(f"Extrap: L={L} -> {target_L} | appended {total_insert} layers by {mode}")
-    print(f"  appended ({tag}) layers: {added}")
+    print(f"G_drift: L={L} -> {target_L} | stack skeleton (i mod {L}) + spectral depth-drift, eps={eps}")
+    print(f"  per-tile drift (eps*k): {[round(eps * (p // L), 3) for p in range(0, target_L, L)]}")
     return src, new, None
 
 
@@ -482,28 +417,19 @@ def main():
     p.add_argument("--uv-align", action="store_true",
                    help="use the U,V-consistent paired-slerp interpolation (reconstructs endpoints) "
                         "instead of the default independent-geodesic interpolation. OFF by default.")
-    p.add_argument("--ot-match", action="store_true",
-                   help="paired-slerp interpolation but PAIR singular triplets by direction overlap "
-                        "(Hungarian on |Ul^T Ur|+|Vl^T Vr|) instead of by singular-value order, so the "
-                        "interpolated layers are coherent (fixes the gate-smax blow-up). Overrides "
-                        "--uv-align. Only used by the interpolation path.")
     p.add_argument("--gstack", action="store_true",
                    help="G_stack baseline: plain depthwise stacking (copy-paste, layer i <- i mod L), "
                         "no interpolation/gates. For a fair comparison against the interpolation method.")
-    p.add_argument("--extrap", action="store_true",
-                   help="extrapolation growth: APPEND total_insert new layers at the end, each "
-                        "continuing the last-gap (L-2 -> L-1) SVD trajectory -- geodesic U,V rotation "
-                        "+ erank-frozen spectrum + capped scale extrapolation -- instead of "
-                        "copying (gstack) or interpolating. Gated (function-preserving) by default; "
-                        "add --no-gate for direct.")
+    p.add_argument("--gdrift", action="store_true",
+                   help="G_drift: G_stack skeleton (layer i mod L) + a small spectral depth-drift that "
+                        "rotates tile k by eps*k along the base layers' own trajectory, breaking the "
+                        "frozen period-L structure while keeping every layer a small rotation of a REAL "
+                        "layer. Plain Qwen2, no gates. eps=0 reproduces G_stack exactly.")
+    p.add_argument("--eps", type=float, default=0.1,
+                   help="G_drift strength: tile k drifts by eps*k along the base trajectory "
+                        "(0 = exact G_stack). Only used with --gdrift.")
     p.add_argument("--theta-max", type=float, default=0.6,
-                   help="cap (radians) on each singular direction's cumulative rotation during "
-                        "--extrap; smaller = more conservative. Only used with --extrap.")
-    p.add_argument("--copy-last", action="store_true",
-                   help="ablation baseline for --extrap: APPEND total_insert exact copies of the "
-                        "last layer (same append-at-end structure, no trajectory). Defaults to "
-                        "PLAIN / no gate (copies are real trained layers, active from step 0). "
-                        "Run vs --extrap to isolate the value of the geodesic+scale continuation.")
+                   help="cap (radians) on the per-tile rotation during --gdrift.")
     args = p.parse_args()
 
     if args.fold:
@@ -514,15 +440,13 @@ def main():
     if args.gstack:
         gated = False
         src, new, plan = stack_grow(args.source, args.total_insert)
-    elif args.extrap or args.copy_last:
-        if args.copy_last:
-            gated = False            # copy-last baseline defaults to plain (no gate)
-        src, new, plan = extrap_grow(args.source, args.total_insert,
-                                     theta_max=args.theta_max, gated=gated,
-                                     copy_last=args.copy_last)
+    elif args.gdrift:
+        gated = False
+        src, new, plan = gdrift_grow(args.source, args.total_insert,
+                                     eps=args.eps, theta_max=args.theta_max)
     else:
         src, new, plan = grow(args.source, args.total_insert, args.per_gap,
-                              gated=gated, uv_align=args.uv_align, ot_match=args.ot_match)
+                              gated=gated, uv_align=args.uv_align)
     check_preservation(src, new, vocab=new.config.vocab_size, expect_zero=gated)
 
     os.makedirs(args.out, exist_ok=True)
