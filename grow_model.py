@@ -223,11 +223,15 @@ def grow(source_path, total_insert, per_gap, gated=True, uv_align=False):
 
 
 @torch.no_grad()
-def stack_grow(source_path, total_insert):
+def stack_grow(source_path, total_insert, skip_first=0):
     """G_stack baseline (Du et al. 2024): plain depthwise stacking -- the grown layer i takes
     the weights of source layer (i mod L). Pure copy-paste, no interpolation, no gates; the
     deeper model is the L-layer block tiled. This is ONLY the core G_stack init operator (for
-    a fair comparison), not their LR / growth-timing recipe."""
+    a fair comparison), not their LR / growth-timing recipe.
+
+    skip_first>0: keep the first `skip_first` (boundary, embedding-adjacent) layers verbatim
+    ONCE at the front and tile only the interior layers skip_first..L-1 for the rest, so the
+    early layer(s) are not repeated. skip_first=0 is standard G_stack."""
     from transformers import Qwen2Config, Qwen2ForCausalLM
     src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32)
     src.eval()
@@ -247,10 +251,14 @@ def stack_grow(source_path, total_insert):
     if not cfg.tie_word_embeddings:
         new.lm_head.load_state_dict(src.lm_head.state_dict())
     new.tie_weights()
-    for i in range(target_L):
-        new.model.layers[i].load_state_dict(src.model.layers[i % L].state_dict())
-    print(f"G_stack: L={L} -> {target_L} | grown layer i <- source layer (i mod {L})")
-    print(f"  layer mapping: {[i % L for i in range(target_L)]}")
+    Lint = L - skip_first                                       # interior block (layers skip_first..L-1)
+    mapping = [p if p < skip_first else skip_first + ((p - skip_first) % Lint)
+               for p in range(target_L)]
+    for p, src_idx in enumerate(mapping):
+        new.model.layers[p].load_state_dict(src.model.layers[src_idx].state_dict())
+    tag = "standard" if skip_first == 0 else f"keep first {skip_first} verbatim, tile interior {skip_first}..{L-1}"
+    print(f"G_stack: L={L} -> {target_L} | {tag}")
+    print(f"  layer mapping: {mapping}")
     return src, new, None
 
 
@@ -421,9 +429,10 @@ def main():
     p.add_argument("--eps", type=float, default=1.0,
                    help="G_stack-scale strength: tile k scaled by exp(eps*b*L*k) along the fitted "
                         "log-scale slope b (0 = exact G_stack; 1 = full trend extrapolation).")
-    p.add_argument("--skip-first", type=int, default=1,
-                   help="G_stack-scale: number of early boundary layers to EXCLUDE when fitting the "
-                        "log-scale trend (layer 0 is embedding-adjacent and off-trend). Default 1.")
+    p.add_argument("--skip-first", type=int, default=0,
+                   help="For --gstack and --gstack-scale: keep the first N (boundary, embedding-adjacent) "
+                        "layers verbatim ONCE at the front and tile/grow only the interior layers N..L-1, "
+                        "so the early layer(s) are not repeated. Default 0 (standard).")
     args = p.parse_args()
 
     if args.fold:
@@ -433,7 +442,7 @@ def main():
     gated = not args.no_gate
     if args.gstack:
         gated = False
-        src, new, plan = stack_grow(args.source, args.total_insert)
+        src, new, plan = stack_grow(args.source, args.total_insert, skip_first=args.skip_first)
     elif args.gstack_scale:
         gated = False
         src, new, plan = gstack_scale_grow(args.source, args.total_insert,
