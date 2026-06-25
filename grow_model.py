@@ -255,52 +255,38 @@ def stack_grow(source_path, total_insert):
 
 
 @torch.no_grad()
-def gdrift_grow(source_path, total_insert, eps=0.1, theta_max=0.6):
-    """G_drift: G_stack skeleton (grown layer p <- base layer p mod L) PLUS a small spectral
-    depth-drift on the repeated tiles. From the base layers' OWN depth trajectory we estimate,
-    per weight matrix, the net rotation of the singular bases (U, V) and the net energy change
-    across the block; tile k (= p // L) rotates its U, V by eps*k along that trajectory and
-    scales its spectrum by exp(eps*k * energy_drift) -- erank-preserving (shape frozen).
-    So the tiles become block / block+drift / block+2*drift / ... , breaking G_stack's frozen
-    period-L structure while every layer stays a SMALL rotation of a REAL trained layer
-    (coherent). eps=0 reproduces G_stack exactly (lower bound). Plain Qwen2, no gates."""
-    import scipy.linalg
+def gstack_scale_grow(source_path, total_insert, eps=1.0, cap=3.0, skip_first=1):
+    """G_stack-scale (SVD): G_stack skeleton (FRAMES U,V copied verbatim -- the only Finding-3-safe
+    thing to do with the unpredictable rotation DIRECTION) + an EXTRAPOLATED spectrum. We SVD every
+    base layer, fit EACH singular value's own log-trend slope b_j across the base block (Finding 2:
+    the spectrum's scale -- and a small amount of its shape -- drift smoothly/monotonically with
+    depth, the PREDICTABLE part), then extrapolate across tiles: tile k's singular values become
+    s_j * exp(eps * b_j * L * k), capped at +/- `cap` in log so they cannot blow up. Reassemble with
+    the copied frames. Frames untouched -> no frame prediction (Finding-3 safe); eps=0 -> G_stack."""
     src = AutoModelForCausalLM.from_pretrained(source_path, torch_dtype=torch.float32).eval()
     L = src.config.num_hidden_layers
-    if L < 2:
-        raise SystemExit("gdrift needs >= 2 source layers to estimate the depth trajectory")
+    if L - skip_first < 2:
+        raise SystemExit(f"gstack-scale needs >= 2 layers after skip_first={skip_first} to fit the trend")
     target_L = L + total_insert
     sds = [src.model.layers[l].state_dict() for l in range(L)]
     keys2d = [k for k, v in sds[0].items() if v.ndim == 2]
+    ls = torch.arange(L, dtype=torch.float64)
+    fl = ls[skip_first:]                                                        # layers used to fit the trend
 
-    # per 2-D weight key: per-base-layer SVD + NET rotation generators (U,V) + net log-energy drift
-    traj = {}
+    # SVD every base layer per key; fit per-singular-value log-trend slope b_j (skipping early layers)
+    spec = {}
     for k in keys2d:
         Us, Ss, Vs = [], [], []
         for l in range(L):
             U, S, Vh = torch.linalg.svd(sds[l][k].double(), full_matrices=False)
             Us.append(U); Ss.append(S); Vs.append(Vh.T)
-        def net_gen(F):
-            M = F[0].T @ F[-1]                               # r x r, frame_0 -> frame_{L-1}
-            u, _, vh = torch.linalg.svd(M)                   # polar -> closest orthogonal
-            return torch.tensor(scipy.linalg.logm((u @ vh).cpu().numpy()).real, dtype=torch.float64)
-        OU, OV = net_gen(Us), net_gen(Vs)
-        de = torch.log(Ss[-1].sum()) - torch.log(Ss[0].sum())
-        traj[k] = (Us, Ss, Vs, OU, OV, de)
+        logS = torch.stack([s.clamp_min(1e-12).log() for s in Ss])             # [L, r]
+        fS = logS[skip_first:]                                                 # drop early boundary layers
+        b = (((fl - fl.mean())[:, None] * (fS - fS.mean(0))).sum(0)
+             / ((fl - fl.mean()) ** 2).sum())                                  # [r] per-component slope
+        spec[k] = (Us, Ss, Vs, b)
 
-    def clamp_gen(Omega, tmax):
-        n = torch.linalg.matrix_norm(Omega, 2)
-        return Omega * (tmax / n) if n > tmax else Omega
-
-    qcache = {}
-    def rot(k, side, scale):                                 # cached exp(scale * net_gen), clamped
-        key = (k, side, float(scale))
-        if key not in qcache:
-            Omega = traj[k][3] if side == "U" else traj[k][4]
-            qcache[key] = torch.matrix_exp(clamp_gen(scale * Omega, theta_max))
-        return qcache[key]
-
-    # plain Qwen2 (every layer is a small rotation of a real layer -> coherent, no gates needed)
+    # plain Qwen2, G_stack skeleton, no gates
     cfg_dict = src.config.to_dict()
     for kk in ("model_type", "architectures", "auto_map",
                "transformers_version", "_name_or_path", "layer_types"):
@@ -315,23 +301,29 @@ def gdrift_grow(source_path, total_insert, eps=0.1, theta_max=0.6):
         new.lm_head.load_state_dict(src.lm_head.state_dict())
     new.tie_weights()
 
+    Lint = L - skip_first                                       # interior block (layers skip_first..L-1)
     for p in range(target_L):
-        i, tile = p % L, p // L                             # base index, tile index
-        scale = eps * tile                                  # tile 0 = exact (= G_stack)
+        if p < skip_first:                                      # keep early boundary layers verbatim (once)
+            new.model.layers[p].load_state_dict(
+                {k: v.clone() for k, v in sds[p].items()}, strict=True)
+            continue
+        j = p - skip_first
+        i, tile = skip_first + (j % Lint), j // Lint            # interior source layer, tile index
         out = {}
         for key, v in sds[i].items():
-            if v.ndim != 2 or scale == 0.0:
-                out[key] = v.clone()                        # 1-D, or tile 0: exact base layer i
+            if v.ndim == 2 and tile > 0 and eps != 0.0:         # tile 0 / eps=0 = plain (skip-first) stacking
+                Us, Ss, Vs, b = spec[key]
+                expo = torch.clamp(eps * b * Lint * tile, -cap, cap)   # cap per-component drift
+                s_new = Ss[i] * torch.exp(expo)                        # extrapolate each singular value
+                out[key] = ((Us[i] * s_new) @ Vs[i].T).to(v.dtype)
             else:
-                Us, Ss, Vs, OU, OV, de = traj[key]
-                U = Us[i] @ rot(key, "U", scale)
-                V = Vs[i] @ rot(key, "V", scale)
-                s = Ss[i] * torch.exp(scale * de)           # scale only -> erank preserved
-                out[key] = ((U * s) @ V.T).to(v.dtype)
+                out[key] = v.clone()
         new.model.layers[p].load_state_dict(out, strict=True)
 
-    print(f"G_drift: L={L} -> {target_L} | stack skeleton (i mod {L}) + spectral depth-drift, eps={eps}")
-    print(f"  per-tile drift (eps*k): {[round(eps * (p // L), 3) for p in range(0, target_L, L)]}")
+    print(f"G_stack-scale (SVD): L={L} -> {target_L} | keep first {skip_first} layer(s) verbatim, "
+          f"tile interior layers {skip_first}..{L-1} + per-singular-value scale extrapolation, eps={eps}")
+    print("  mean log-scale slope b per weight: "
+          + ", ".join(f"{k.split('.')[-1]}={spec[k][3].mean().item():+.4f}" for k in keys2d))
     return src, new, None
 
 
@@ -420,16 +412,18 @@ def main():
     p.add_argument("--gstack", action="store_true",
                    help="G_stack baseline: plain depthwise stacking (copy-paste, layer i <- i mod L), "
                         "no interpolation/gates. For a fair comparison against the interpolation method.")
-    p.add_argument("--gdrift", action="store_true",
-                   help="G_drift: G_stack skeleton (layer i mod L) + a small spectral depth-drift that "
-                        "rotates tile k by eps*k along the base layers' own trajectory, breaking the "
-                        "frozen period-L structure while keeping every layer a small rotation of a REAL "
-                        "layer. Plain Qwen2, no gates. eps=0 reproduces G_stack exactly.")
-    p.add_argument("--eps", type=float, default=0.1,
-                   help="G_drift strength: tile k drifts by eps*k along the base trajectory "
-                        "(0 = exact G_stack). Only used with --gdrift.")
-    p.add_argument("--theta-max", type=float, default=0.6,
-                   help="cap (radians) on the per-tile rotation during --gdrift.")
+    p.add_argument("--gstack-scale", action="store_true",
+                   help="G_stack-scale: G_stack skeleton (frames copied verbatim -- Finding-3-safe) "
+                        "+ an EXTRAPOLATED monotonic spectral scale (Finding 2: scale is the predictable "
+                        "part, so it can be extended). Multiplies tile k by exp(eps*b*L*k) so the overall "
+                        "magnitude climbs monotonically across tiles instead of resetting. Plain Qwen2, "
+                        "no gates. eps=0 reproduces G_stack exactly.")
+    p.add_argument("--eps", type=float, default=1.0,
+                   help="G_stack-scale strength: tile k scaled by exp(eps*b*L*k) along the fitted "
+                        "log-scale slope b (0 = exact G_stack; 1 = full trend extrapolation).")
+    p.add_argument("--skip-first", type=int, default=1,
+                   help="G_stack-scale: number of early boundary layers to EXCLUDE when fitting the "
+                        "log-scale trend (layer 0 is embedding-adjacent and off-trend). Default 1.")
     args = p.parse_args()
 
     if args.fold:
@@ -440,10 +434,10 @@ def main():
     if args.gstack:
         gated = False
         src, new, plan = stack_grow(args.source, args.total_insert)
-    elif args.gdrift:
+    elif args.gstack_scale:
         gated = False
-        src, new, plan = gdrift_grow(args.source, args.total_insert,
-                                     eps=args.eps, theta_max=args.theta_max)
+        src, new, plan = gstack_scale_grow(args.source, args.total_insert,
+                                           eps=args.eps, skip_first=args.skip_first)
     else:
         src, new, plan = grow(args.source, args.total_insert, args.per_gap,
                               gated=gated, uv_align=args.uv_align)
