@@ -120,24 +120,28 @@ class GrowTrainer(Trainer):
         # produces a non-finite grad; skipping that single update keeps training
         # alive and is symmetric across baseline/grown runs (same data+seed ->
         # same block skipped at the same step), so the comparison stays fair.
-        opt = super().create_optimizer()
+        name = getattr(self, "_optimizer_name", "adamw")
+        if name == "muon":
+            opt = self._build_muon_optimizer()
+        else:
+            opt = super().create_optimizer()
 
-        # Optional: put the alpha/beta gates in their OWN param group with a higher LR so
-        # they open faster (gate_lr = base_lr * gate_lr_mult). The cosine scheduler scales
-        # every group by the same factor, so this just raises the gates' base LR.
-        # gate_lr_mult == 1.0 -> skip entirely -> identical to the original single-LR setup.
-        mult = getattr(self, "_gate_lr_mult", 1.0)
-        if mult != 1.0:
-            gate_ids = {id(p) for n, p in self.model.named_parameters() if n.endswith(".gate")}
-            gates = []
-            for g in opt.param_groups:
-                gates += [p for p in g["params"] if id(p) in gate_ids]
-                g["params"] = [p for p in g["params"] if id(p) not in gate_ids]
-            if gates:
-                opt.add_param_group({"params": gates, "weight_decay": 0.0,
-                                     "lr": self.args.learning_rate * mult})
-                print(f"[gate-lr] {len(gates)} gate params in a separate group, "
-                      f"lr = {mult}x base = {self.args.learning_rate * mult:.2e}")
+            # Optional: put the alpha/beta gates in their OWN param group with a higher LR so
+            # they open faster (gate_lr = base_lr * gate_lr_mult). The cosine scheduler scales
+            # every group by the same factor, so this just raises the gates' base LR.
+            # gate_lr_mult == 1.0 -> skip entirely -> identical to the original single-LR setup.
+            mult = getattr(self, "_gate_lr_mult", 1.0)
+            if mult != 1.0:
+                gate_ids = {id(p) for n, p in self.model.named_parameters() if n.endswith(".gate")}
+                gates = []
+                for g in opt.param_groups:
+                    gates += [p for p in g["params"] if id(p) in gate_ids]
+                    g["params"] = [p for p in g["params"] if id(p) not in gate_ids]
+                if gates:
+                    opt.add_param_group({"params": gates, "weight_decay": 0.0,
+                                         "lr": self.args.learning_rate * mult})
+                    print(f"[gate-lr] {len(gates)} gate params in a separate group, "
+                          f"lr = {mult}x base = {self.args.learning_rate * mult:.2e}")
 
         self._skipped_nan_steps = 0
         trainer = self
@@ -163,13 +167,70 @@ class GrowTrainer(Trainer):
         # Optional: warm-start the moments of the KEPT layers from the source checkpoint's
         # optimizer (Staged-Training style) to avoid the cold-Adam slowdown after growth.
         src = getattr(self, "_init_opt_from", None)
-        if src:
+        if src and name == "muon":
+            print("[momentum transfer] SKIPPED: not supported for --optimizer muon "
+                  "(Adam-moment transfer only); Muon momentum buffers start fresh.")
+        elif src:
             try:
                 from momentum_transfer import transfer_moments
                 transfer_moments(self.model, opt, src, self.get_decay_parameter_names,
                                  warm_inserted=getattr(self, "_warm_inserted", False))
             except Exception as e:
                 print(f"[momentum transfer] FAILED ({e}); continuing with fresh optimizer.")
+        return opt
+
+    def _build_muon_optimizer(self):
+        """Hybrid Muon (2D hidden matrices) + AdamW (embed / lm_head / norm / bias / gate).
+
+        Splits params by role: any >=2D weight that isn't an embedding/lm_head goes
+        through Muon; everything else (1D norms & biases, the tied embedding, the
+        scalar alpha/beta gates) stays on AdamW. `--lr` is the aux-AdamW lr; the Muon
+        matrix lr is `--muon-lr`. The cosine LambdaLR scales BOTH groups' base lr by
+        the same factor, so they decay together.
+        """
+        from muon import SingleDeviceMuonWithAuxAdam
+
+        mult = getattr(self, "_gate_lr_mult", 1.0)
+        muon_lr = getattr(self, "_muon_lr", 0.02)
+        adam_lr = self.args.learning_rate
+        wd = self.args.weight_decay
+        betas = (self.args.adam_beta1, self.args.adam_beta2)
+        eps = self.args.adam_epsilon
+
+        muon_p, adam_decay, adam_nodecay, gate_p = [], [], [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.endswith(".gate"):
+                gate_p.append(p)
+            elif p.ndim >= 2 and "embed" not in n.lower() and "lm_head" not in n.lower():
+                muon_p.append(p)            # attn q/k/v/o + MLP up/down weights -> Muon
+            elif p.ndim >= 2:
+                adam_decay.append(p)         # embedding / lm_head -> AdamW (with decay)
+            else:
+                adam_nodecay.append(p)       # norms & biases -> AdamW (no decay)
+
+        groups = []
+        if muon_p:
+            groups.append({"params": muon_p, "use_muon": True, "lr": muon_lr,
+                           "momentum": 0.95, "weight_decay": wd})
+        if adam_decay:
+            groups.append({"params": adam_decay, "use_muon": False, "lr": adam_lr,
+                           "betas": betas, "eps": eps, "weight_decay": wd})
+        if adam_nodecay:
+            groups.append({"params": adam_nodecay, "use_muon": False, "lr": adam_lr,
+                           "betas": betas, "eps": eps, "weight_decay": 0.0})
+        if gate_p:
+            groups.append({"params": gate_p, "use_muon": False, "lr": adam_lr * mult,
+                           "betas": betas, "eps": eps, "weight_decay": 0.0})
+
+        opt = SingleDeviceMuonWithAuxAdam(groups)
+        self.optimizer = opt
+        n_muon = sum(p.numel() for p in muon_p)
+        n_aux = sum(p.numel() for g in (adam_decay, adam_nodecay, gate_p) for p in g)
+        print(f"[muon] {len(muon_p)} matrices ({n_muon/1e6:.1f}M params) @ lr={muon_lr:.3g} | "
+              f"aux-AdamW {n_aux/1e6:.1f}M @ lr={adam_lr:.2g}"
+              + (f" | gates @ {mult}x" if gate_p and mult != 1.0 else ""))
         return opt
 
 
@@ -313,6 +374,14 @@ def main():
     p.add_argument("--gate-lr-mult", type=float, default=1.0,
                    help="LR multiplier for the alpha/beta gate params (separate optimizer group). "
                         "1.0 = identical to the original single-LR setup; >1 opens gates faster.")
+    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
+                   help="adamw (default) or muon. muon orthogonalizes updates on the 2D hidden "
+                        "matrices (attn/MLP weights) and runs AdamW on embed/lm_head/norm/bias/gate. "
+                        "NOTE: --lr becomes the AUX-AdamW lr; the Muon matrix lr is --muon-lr.")
+    p.add_argument("--muon-lr", type=float, default=0.02,
+                   help="Muon learning rate for the 2D hidden matrices (only used with "
+                        "--optimizer muon). Orthogonalized updates are ~unit-RMS, so this is "
+                        "~100x larger than an AdamW lr; 0.01-0.05 is the usual range.")
     p.add_argument("--skip-samples", type=int, default=0,
                    help="phase-2: number of samples the prior phase consumed (overrides the "
                         "auto value prior_steps*batch_size*grad_accum). Normally leave 0 and just "
@@ -473,6 +542,8 @@ def main():
     trainer._init_opt_from = args.init_optimizer_from  # optional Adam-moment warm-start
     trainer._warm_inserted = args.warm_inserted        # also warm inserted layers' moments
     trainer._gate_lr_mult = args.gate_lr_mult          # separate (higher) LR for alpha/beta gates
+    trainer._optimizer_name = args.optimizer           # "adamw" (default) or "muon"
+    trainer._muon_lr = args.muon_lr                    # Muon matrix LR (only if optimizer == muon)
 
     print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
