@@ -192,6 +192,7 @@ class GrowTrainer(Trainer):
 
         mult = getattr(self, "_gate_lr_mult", 1.0)
         muon_lr = getattr(self, "_muon_lr", 0.02)
+        muon_wd = getattr(self, "_muon_wd", 0.0)   # SEPARATE from adam wd (decoupled WD scales with lr)
         adam_lr = self.args.learning_rate
         wd = self.args.weight_decay
         betas = (self.args.adam_beta1, self.args.adam_beta2)
@@ -213,7 +214,7 @@ class GrowTrainer(Trainer):
         groups = []
         if muon_p:
             groups.append({"params": muon_p, "use_muon": True, "lr": muon_lr,
-                           "momentum": 0.95, "weight_decay": wd})
+                           "momentum": 0.95, "weight_decay": muon_wd})
         if adam_decay:
             groups.append({"params": adam_decay, "use_muon": False, "lr": adam_lr,
                            "betas": betas, "eps": eps, "weight_decay": wd})
@@ -228,8 +229,8 @@ class GrowTrainer(Trainer):
         self.optimizer = opt
         n_muon = sum(p.numel() for p in muon_p)
         n_aux = sum(p.numel() for g in (adam_decay, adam_nodecay, gate_p) for p in g)
-        print(f"[muon] {len(muon_p)} matrices ({n_muon/1e6:.1f}M params) @ lr={muon_lr:.3g} | "
-              f"aux-AdamW {n_aux/1e6:.1f}M @ lr={adam_lr:.2g}"
+        print(f"[muon] {len(muon_p)} matrices ({n_muon/1e6:.1f}M params) @ lr={muon_lr:.3g} "
+              f"wd={muon_wd:.3g} | aux-AdamW {n_aux/1e6:.1f}M @ lr={adam_lr:.2g} wd={wd:.3g}"
               + (f" | gates @ {mult}x" if gate_p and mult != 1.0 else ""))
         return opt
 
@@ -382,6 +383,12 @@ def main():
                    help="Muon learning rate for the 2D hidden matrices (only used with "
                         "--optimizer muon). Orthogonalized updates are ~unit-RMS, so this is "
                         "~100x larger than an AdamW lr; 0.01-0.05 is the usual range.")
+    p.add_argument("--muon-wd", type=float, default=0.0,
+                   help="weight decay for the Muon (matrix) group ONLY. Kept SEPARATE from "
+                        "--weight-decay because decoupled WD shrinks by lr*wd per step: with "
+                        "muon-lr ~100x an AdamW lr, reusing wd=0.1 applies ~100x too much decay "
+                        "and crushes the weights. Default 0; a comparable-to-Adam value is "
+                        "adam_wd * adam_lr / muon_lr (e.g. 0.1*2e-4/0.02 = 1e-3).")
     p.add_argument("--skip-samples", type=int, default=0,
                    help="phase-2: number of samples the prior phase consumed (overrides the "
                         "auto value prior_steps*batch_size*grad_accum). Normally leave 0 and just "
@@ -544,6 +551,7 @@ def main():
     trainer._gate_lr_mult = args.gate_lr_mult          # separate (higher) LR for alpha/beta gates
     trainer._optimizer_name = args.optimizer           # "adamw" (default) or "muon"
     trainer._muon_lr = args.muon_lr                    # Muon matrix LR (only if optimizer == muon)
+    trainer._muon_wd = args.muon_wd                    # Muon matrix weight decay (separate from adam wd)
 
     print(f"Logging metrics to: {args.log_file}")
     print("Starting pretraining...")
